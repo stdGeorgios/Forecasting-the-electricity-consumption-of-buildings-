@@ -64,9 +64,9 @@ URBAN_RURAL_OPTIONS = [
 ]
 
 DEFAULT_ENSEMBLE_WEIGHTS = {
-    "rf": 0.50,
-    "xgb": 0.25,
-    "lgbm": 0.25,
+    "rf": 0.40,
+    "xgb": 0.30,
+    "lgbm": 0.30,
 }
 
 
@@ -269,8 +269,8 @@ def _normalize_behavior_inputs(
     except Exception:
         raise ValueError("Το behavior factor πρέπει να είναι αριθμός.")
 
-    if factor < 1.0:
-        raise ValueError("Το behavior factor πρέπει να είναι >= 1.0.")
+    if factor <= 0:
+        raise ValueError("Το behavior factor πρέπει να είναι > 0.")
 
     hours = _parse_behavior_hours(high_consumption_hours_text)
 
@@ -278,6 +278,7 @@ def _normalize_behavior_inputs(
         return False, [], 1.0
 
     return True, hours, factor
+ 
 
 
 def _resolve_ensemble_weights(
@@ -367,10 +368,17 @@ def _behavior_summary_suffix(
     if not enabled:
         return "Behavioral adjustment: OFF"
 
+    if factor > 1:
+        effect = f"increase by {(factor - 1) * 100:.1f}%"
+    elif factor < 1:
+        effect = f"decrease by {(1 - factor) * 100:.1f}%"
+    else:
+        effect = "no change"
+
     return (
         "Behavioral adjustment: ON\n"
-        f"High consumption hours: {hours}\n"
-        f"Behavior factor: {factor:.2f}"
+        f"Adjusted hours: {hours}\n"
+        f"Behavior factor: {factor:.2f} ({effect})"
     )
 
 
@@ -1611,9 +1619,10 @@ with gr.Blocks(title="IDEAL Forecasting UI") as demo:
 
     with gr.Accordion("Behavioral adjustment (optional)", open=False):
         gr.Markdown(
-            "Προαιρετικό post-processing των προβλέψεων.\n"
-            "Δήλωσε διαστήματα αυξημένης αναμενόμενης κατανάλωσης, π.χ. **7-9,18-23**.\n"
-            "Το ML μοντέλο δεν αλλάζει· η προσαρμογή εφαρμόζεται μόνο στο UI."
+           "Προαιρετικό post-processing των προβλέψεων.\n"
+   	   "Δήλωσε ώρες στις οποίες αναμένεις διαφορετική κατανάλωση, π.χ. **7-9,18-23**.\n"
+   	   "Τιμή factor > 1 αυξάνει την κατανάλωση, ενώ τιμή factor < 1 τη μειώνει.\n"
+  	   "Το ML μοντέλο δεν αλλάζει· η προσαρμογή εφαρμόζεται μόνο στο UI."
         )
 
         enable_behavior_adjustment = gr.Checkbox(
@@ -1623,15 +1632,15 @@ with gr.Blocks(title="IDEAL Forecasting UI") as demo:
 
         high_consumption_hours_text = gr.Textbox(
             value="",
-            label="High consumption hours",
+            label="Adjusted hours",
             placeholder="π.χ. 7-9, 13-15, 18-23",
         )
 
         behavior_factor = gr.Number(
             value=1.15,
-            minimum=1.0,
+            minimum=0.01,
             label="Behavior factor",
-            info="Παράδειγμα: 1.15 σημαίνει +15% στις δηλωμένες ώρες.",
+            info="Παράδειγμα: 1.15 σημαίνει +15% ενώ 0.90 σημαίνει -10% στις δηλωμένες ώρες.",
         )
 
     with gr.Accordion("Ensemble weights (optional)", open=False):
