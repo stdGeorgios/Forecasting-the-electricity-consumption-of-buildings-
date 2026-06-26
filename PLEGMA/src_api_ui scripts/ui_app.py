@@ -1,15 +1,73 @@
+# C:/Plegma_Programming/src/ui_app.py
+# ---------------------------------------------------------
+# Gradio UI for PLEGMA Forecasting API - Generic UI version
+# ---------------------------------------------------------
+#
+# Final API/UI assumptions:
+#   - The user does NOT provide home_id.
+#   - model_id="auto" selects the correct default by scenario:
+#       no_history   -> LGBM/no_history_simple
+#       with_history -> LGBM/with_history_generic
+#   - Optional comparison models are selected through the API/model registry.
+#   - With-history requires recent hourly consumption history, default 168 hours.
+#   - History can come from a user-selected single-home CSV path/upload,
+#     manual comma-separated values, or the legacy history_store.csv fallback.
+#   - Weather can come from Open-Meteo, manual t_min/t_max, or manual 24h vectors.
+#
+# PLEGMA ports are intentionally kept separate from IDEAL:
+#   API_BASE = http://127.0.0.1:8001
+#   UI_PORT  = 7861
+# ---------------------------------------------------------
+
 from __future__ import annotations
 
+import os
+
+# Must be set before importing gradio / requests.
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+
 import datetime as dt
+import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
-import pandas as pd
-import requests
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import requests
 
+# ============================================================
+# GRADIO 4.44.x COMPATIBILITY PATCH
+# ============================================================
+
+try:
+    from gradio_client import utils as _gradio_client_utils
+
+    _orig_json_schema_to_python_type = _gradio_client_utils._json_schema_to_python_type
+
+    def _safe_json_schema_to_python_type(schema, defs=None):
+        if isinstance(schema, bool):
+            return "Any"
+
+        if isinstance(schema, dict):
+            schema = dict(schema)
+            if isinstance(schema.get("additionalProperties"), bool):
+                schema["additionalProperties"] = {"type": "object"}
+
+        return _orig_json_schema_to_python_type(schema, defs)
+
+    _gradio_client_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
+
+except Exception as exc:
+    print(f"[WARN] Gradio schema compatibility patch not applied: {exc}")
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 API_BASE = "http://127.0.0.1:8001"
 UI_HOST = "127.0.0.1"
@@ -18,6 +76,9 @@ UI_PORT = 7861
 BASE_DIR = Path("C:/Plegma_Programming")
 UI_EXPORT_DIR = BASE_DIR / "predictions" / "ui_exports"
 UI_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+HISTORY_UPLOAD_DIR = BASE_DIR / "processed" / "stores" / "selected_history_files"
+HISTORY_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 TIMEOUT = 180
 
@@ -30,17 +91,8 @@ SUPPORTED_CITIES = {
     "heraklion": {"label": "Heraklion", "latitude": 35.3387, "longitude": 25.1442},
 }
 
-DEFAULT_BUILDING_TYPES = [
-    "apartment",
-    "detached_house",
-]
-
-DEFAULT_BUILD_ERAS = [
-    "1950_1970",
-    "1970_1990",
-    "1990_2010",
-]
-
+DEFAULT_BUILDING_TYPES = ["apartment", "detached_house"]
+DEFAULT_BUILD_ERAS = ["1950_1970", "1970_1990", "1990_2010"]
 DEFAULT_HEATING_TYPES = [
     "radiator_oil",
     "radiator_gas",
@@ -48,25 +100,30 @@ DEFAULT_HEATING_TYPES = [
     "air_to_air_heat_pump",
     "portable_electric_heaters",
 ]
+DEFAULT_WATER_HEATER_TYPES = ["electric_boiler", "gas_boiler", "solar_boiler"]
+DEFAULT_YEARS_IN_HOUSE = ["1_to_2_years", "3_to_4_years", "gt_5_years"]
+DEFAULT_INCOME_BANDS = ["unknown", "low", "medium", "high"]
+DEFAULT_HOMEOWNER_STATUS = ["renter", "owner", "unknown"]
+DEFAULT_OCCUPATION = ["unknown", "employed", "student", "retired", "unemployed"]
 
-DEFAULT_WATER_HEATER_TYPES = [
-    "electric_boiler",
-    "gas_boiler",
-    "solar_boiler",
-]
-
-DEFAULT_YEARS_IN_HOUSE = [
-    "1_to_2_years",
-    "3_to_4_years",
-    "gt_5_years",
-]
-
+# PLEGMA default ensemble weights. The user can override these in the UI.
 DEFAULT_ENSEMBLE_WEIGHTS = {
-    "rf": 0.30,
-    "xgb": 0.40,
-    "lgbm": 0.30,
+    "rf": 0.25,
+    "xgb": 0.35,
+    "lgbm": 0.40,
 }
 
+MODE_NO_HISTORY = "no_history"
+MODE_WITH_HISTORY = "with_history"
+
+# Legacy names kept only for internal compatibility with old wording.
+MODE_COLDSTART = MODE_NO_HISTORY
+MODE_WITHHISTORY = MODE_WITH_HISTORY
+
+
+# ============================================================
+# DEFAULT ENVIRONMENTAL PROFILES
+# ============================================================
 
 def _default_internal_temperature_24h() -> List[float]:
     return [
@@ -89,6 +146,10 @@ def _default_internal_humidity_24h() -> List[float]:
 def _list24_to_text(vals: List[float]) -> str:
     return ", ".join(f"{float(v):.1f}" for v in vals)
 
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
 
 def _today_date() -> dt.date:
     return dt.date.today()
@@ -113,67 +174,89 @@ def _api_health() -> str:
     try:
         r = requests.get(f"{API_BASE}/health", timeout=3)
         if r.status_code == 200:
-            return "✅ API: OK"
+            js = r.json()
+            ready = js.get("num_ready_models")
+            nohist = js.get("default_no_history_model") or js.get("default_coldstart_model")
+            hist = js.get("default_with_history_model") or js.get("default_withhistory_model")
+            return f"✅ API: OK | Ready models: {ready} | No-history: {nohist} | With-history: {hist}"
         return f"⚠️ API: HTTP {r.status_code}"
     except Exception:
-        return "❌ API: not reachable (start API first)"
+        return "❌ API: not reachable. Start FastAPI first on port 8001."
 
 
-def _fetch_models() -> List[Dict[str, Any]]:
+def _fetch_models_response(mode: Optional[str] = None) -> Dict[str, Any]:
     try:
-        r = requests.get(f"{API_BASE}/models", timeout=5)
+        params = {"mode": mode} if mode else None
+        r = requests.get(f"{API_BASE}/models", params=params, timeout=5)
         r.raise_for_status()
-        models = r.json().get("models", [])
-        if not models:
-            raise RuntimeError("empty /models")
-        return models
+        return r.json()
     except Exception:
+        return {}
+
+
+def _fetch_model_options(mode: Optional[str] = None) -> List[Dict[str, Any]]:
+    js = _fetch_models_response(mode=mode)
+    options = js.get("options_for_ui") or []
+
+    if options:
+        return options
+
+    # Fallback when API is not running yet.
+    if mode == MODE_WITH_HISTORY:
         return [
-            {
-                "model_id": "rf",
-                "name": "Random Forest (PLEGMA)",
-                "type": "sklearn_rf",
-                "supports": ["coldstart", "withhistory"],
-            },
-            {
-                "model_id": "xgb",
-                "name": "XGBoost (PLEGMA)",
-                "type": "xgboost",
-                "supports": ["coldstart", "withhistory"],
-            },
-            {
-                "model_id": "lgbm",
-                "name": "LightGBM (PLEGMA)",
-                "type": "lightgbm",
-                "supports": ["coldstart", "withhistory"],
-            },
+            {"label": "Auto default", "value": "auto", "is_default": True},
+            {"label": "LGBM with-history default", "value": "lgbm_with_history_default"},
+            {"label": "XGB with-history optional", "value": "xgb_with_history_optional"},
+            {"label": "RF with-history optional", "value": "rf_with_history_optional"},
         ]
 
+    return [
+        {"label": "Auto default", "value": "auto", "is_default": True},
+        {"label": "LGBM no-history default", "value": "lgbm_no_history_default"},
+        {"label": "XGB no-history optional", "value": "xgb_no_history_optional"},
+        {"label": "RF no-history optional", "value": "rf_no_history_optional"},
+    ]
 
-def _format_model_choice(m: Dict[str, Any]) -> str:
-    mid = m.get("model_id", "")
-    name = m.get("name", mid)
-    return f"{mid} — {name}"
+
+def _option_to_choice(option: Dict[str, Any]) -> str:
+    value = str(option.get("value", "auto"))
+    label = str(option.get("label", value))
+    marker = ""
+    if option.get("is_default") and value != "auto":
+        marker = " [default]"
+    elif option.get("is_optional"):
+        marker = " [optional]"
+    return f"{value} — {label}{marker}"
 
 
 def _choice_to_model_id(choice: str) -> str:
+    if not choice:
+        return "auto"
     return str(choice).split("—", 1)[0].strip()
+
+
+def _model_choices_for_mode(mode: str) -> List[str]:
+    return [_option_to_choice(o) for o in _fetch_model_options(mode=mode)]
+
+
+def _default_choice_for_mode(mode: str) -> str:
+    choices = _model_choices_for_mode(mode)
+    return choices[0] if choices else "auto — Auto default"
 
 
 def _needs_weather_fallback(detail_text: str) -> bool:
     t = (detail_text or "").lower()
     return (
-        "external_temperature_24h" in t
+        "external temperature" in t
+        or "external_temperature_24h" in t
         or "t_min" in t
         or "t_max" in t
         or "could not resolve external_temperature_24h" in t
+        or "δώσε είτε" in t
     )
 
 
-def _normalize_temp_inputs(
-    t_min: Optional[float],
-    t_max: Optional[float],
-) -> Tuple[Optional[float], Optional[float]]:
+def _normalize_temp_inputs(t_min: Optional[float], t_max: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
     try:
         if t_min is not None:
             t_min = float(t_min)
@@ -182,6 +265,7 @@ def _normalize_temp_inputs(
     except Exception:
         return None, None
 
+    # Some Gradio environments return hidden Number fields as 0 / 0.0.
     if t_min == 0 and t_max == 0:
         return None, None
 
@@ -200,13 +284,11 @@ def _validate_inputs(
     t_max: Optional[float],
 ) -> Optional[str]:
     try:
-        d = _parse_date(target_date)
+        _ = _parse_date(target_date)
     except Exception:
         return "Σφάλμα: target_date πρέπει να είναι σε μορφή YYYY-MM-DD."
 
-    if d < _today_date():
-        return "Σφάλμα: Δεν επιτρέπεται ημερομηνία στο παρελθόν."
-
+    # Past dates are intentionally allowed for backtesting/evaluation.
     if num_rooms is None or float(num_rooms) < 0:
         return "Σφάλμα: num_rooms πρέπει να είναι >= 0."
 
@@ -229,118 +311,354 @@ def _validate_inputs(
     return None
 
 
-def _parse_float_list_24(text: str, name: str) -> List[float]:
-    if not text or not text.strip():
-        raise ValueError(f"Σφάλμα: Το πεδίο {name} πρέπει να έχει 24 τιμές όταν συμπληρώνεται.")
+def _parse_csv_float_list(text: str, name: str, expected_len: Optional[int] = None) -> Optional[List[float]]:
+    if not text or not str(text).strip():
+        return None
 
     try:
-        vals = [float(x.strip()) for x in text.split(",")]
+        vals = [float(x.strip()) for x in str(text).split(",") if x.strip() != ""]
     except Exception:
-        raise ValueError(f"Σφάλμα: Το {name} δεν είναι έγκυρη λίστα αριθμών (comma-separated).")
+        raise ValueError(f"Σφάλμα: {name} δεν είναι έγκυρη λίστα αριθμών comma-separated.")
 
-    if len(vals) != 24:
-        raise ValueError(f"Σφάλμα: Το {name} πρέπει να έχει 24 τιμές (έχει {len(vals)}).")
+    if expected_len is not None and len(vals) != expected_len:
+        raise ValueError(f"Σφάλμα: {name} πρέπει να έχει {expected_len} τιμές. Έχει {len(vals)}.")
 
     return vals
 
 
-def _parse_optional_float_list_24(text: str, name: str) -> Optional[List[float]]:
-    if text is None or not str(text).strip():
-        return None
-    return _parse_float_list_24(text, name)
-
-
-def _fetch_openmeteo_hourly_external_humidity(city: str, target_date: str) -> Optional[List[float]]:
-    city_key = str(city).strip().lower()
-    if city_key not in SUPPORTED_CITIES:
+def _extract_uploaded_file_path(file_obj: Any) -> Optional[str]:
+    if file_obj is None:
         return None
 
-    geo = SUPPORTED_CITIES[city_key]
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": geo["latitude"],
-        "longitude": geo["longitude"],
-        "hourly": "relative_humidity_2m",
-        "timezone": "Europe/Athens",
-        "start_date": str(pd.Timestamp(target_date).date()),
-        "end_date": str(pd.Timestamp(target_date).date()),
-    }
+    if isinstance(file_obj, str):
+        return file_obj
+
+    if isinstance(file_obj, dict):
+        return file_obj.get("name") or file_obj.get("path") or file_obj.get("orig_name")
+
+    return getattr(file_obj, "name", None) or getattr(file_obj, "path", None)
+
+
+def register_history_csv_upload(file_obj: Any) -> Tuple[str, str]:
+    """Copy a selected single-home history CSV to a stable PLEGMA project folder."""
+    src_path = _extract_uploaded_file_path(file_obj)
+
+    if not src_path or not str(src_path).strip():
+        return "", "No history CSV selected."
+
+    src = Path(str(src_path).strip())
+    if not src.exists():
+        return "", f"Selected file does not exist: {src}"
+
+    if src.suffix.lower() != ".csv":
+        return "", "Please select a CSV file."
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_stem = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in src.stem)
+    dst = HISTORY_UPLOAD_DIR / f"{safe_stem}_{timestamp}.csv"
 
     try:
-        r = requests.get(url, params=params, timeout=30)
-    except Exception:
-        return None
+        shutil.copy2(src, dst)
+    except Exception as exc:
+        return "", f"Could not copy selected file: {exc}"
 
-    if r.status_code != 200:
+    return str(dst), f"Selected history CSV: {dst}"
+
+
+def _resolve_history_csv_path(history_csv_file: Any, history_csv_path_text: str) -> Optional[str]:
+    if history_csv_path_text and str(history_csv_path_text).strip():
+        return str(history_csv_path_text).strip().strip('"').strip("'")
+
+    file_path = _extract_uploaded_file_path(history_csv_file)
+    if file_path and str(file_path).strip():
+        return str(file_path).strip().strip('"').strip("'")
+
+    return None
+
+
+# ============================================================
+# HISTORY STABILITY / MAX ALPHA RECOMMENDATION
+# ============================================================
+
+def _clamp01(x: float) -> float:
+    try:
+        x = float(x)
+    except Exception:
+        return 0.0
+    return max(0.0, min(1.0, x))
+
+
+def _score_from_cv(cv_value: Optional[float], cv_bad: float) -> float:
+    if cv_value is None or pd.isna(cv_value):
+        return 0.50
+    try:
+        cv = float(cv_value)
+    except Exception:
+        return 0.50
+    if cv < 0:
+        return 0.50
+    return _clamp01(1.0 - (cv / float(cv_bad)))
+
+
+def _safe_cv(series: pd.Series) -> Optional[float]:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) <= 1:
         return None
+    mean_val = float(s.mean())
+    if abs(mean_val) < 1e-9:
+        return None
+    return float(s.std(ddof=0) / mean_val)
+
+
+def _resolve_effective_history_alpha(
+    use_history: bool,
+    use_recommended_history_alpha: bool,
+    recommended_history_correction_max_alpha: Optional[float],
+    manual_history_correction_max_alpha: float,
+) -> float:
+    try:
+        manual_alpha = float(manual_history_correction_max_alpha)
+    except Exception:
+        manual_alpha = 0.20
+
+    if not use_history or not use_recommended_history_alpha:
+        return manual_alpha
+
+    if recommended_history_correction_max_alpha is None or str(recommended_history_correction_max_alpha).strip() == "":
+        raise ValueError(
+            "Έχεις ενεργό το 'Use recommended max alpha', αλλά δεν υπάρχει έγκυρη σύσταση. "
+            "Πάτησε πρώτα Analyze history stability ή απενεργοποίησε το checkbox."
+        )
 
     try:
-        js = r.json()
+        return float(recommended_history_correction_max_alpha)
     except Exception:
-        return None
-
-    vals = js.get("hourly", {}).get("relative_humidity_2m")
-    if not isinstance(vals, list) or len(vals) < 24:
-        return None
-
-    return [float(x) for x in vals[:24]]
+        raise ValueError("Η προτεινόμενη τιμή max_alpha δεν είναι έγκυρη. Πάτησε ξανά Analyze history stability.")
 
 
-def _build_external_humidity_profile_from_mean(mean_humidity: float) -> List[float]:
-    mean_humidity = float(mean_humidity)
-
-    profile = []
-    for h in range(24):
-        delta = 4.0 * np.cos(2 * np.pi * (h - 5) / 24.0)
-        val = mean_humidity + delta
-        val = max(20.0, min(95.0, val))
-        profile.append(float(round(val, 1)))
-
-    return profile
-
-
-def _check_needed_fallback_inputs(
-    city: str,
+def _history_dataframe_from_inputs(
+    history_csv_file: Any,
+    history_csv_path_text: str,
+    history_consumption_text: str,
     target_date: str,
-    external_temperature_24h_text: str,
-) -> bool:
-    city_key = str(city).strip().lower()
-    if city_key not in SUPPORTED_CITIES:
-        return True
+    history_days: int,
+) -> Tuple[pd.DataFrame, str]:
+    target_start = pd.Timestamp(_parse_date(target_date))
 
-    geo = SUPPORTED_CITIES[city_key]
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": geo["latitude"],
-        "longitude": geo["longitude"],
-        "hourly": "temperature_2m,relative_humidity_2m",
-        "timezone": "Europe/Athens",
-        "start_date": str(pd.Timestamp(target_date).date()),
-        "end_date": str(pd.Timestamp(target_date).date()),
-    }
+    manual_values = _parse_csv_float_list(history_consumption_text, "history_consumption_Wh", expected_len=None)
+    if manual_values is not None:
+        if len(manual_values) < 1:
+            raise ValueError("Το manual history_consumption_Wh είναι κενό.")
+        start = target_start - pd.Timedelta(hours=len(manual_values))
+        timestamps = pd.date_range(start, periods=len(manual_values), freq="h")
+        hist = pd.DataFrame({"timestamp": timestamps, "consumption_Wh": [float(x) for x in manual_values]})
+        return hist, "manual history_consumption_Wh"
 
+    history_csv_path = _resolve_history_csv_path(history_csv_file, history_csv_path_text)
+    if not history_csv_path:
+        raise ValueError("Δεν έχει επιλεγεί history CSV και δεν δόθηκε manual history_consumption_Wh.")
+
+    path = Path(str(history_csv_path).strip().strip('"').strip("'"))
+    if not path.exists():
+        raise ValueError(f"Δεν βρέθηκε το history CSV: {path}")
+
+    hist = pd.read_csv(path, low_memory=False)
+    col_map = {str(c).lower(): c for c in hist.columns}
+    ts_col = col_map.get("timestamp") or col_map.get("datetime") or col_map.get("date_time") or col_map.get("time")
+    val_col = (
+        col_map.get("consumption_wh")
+        or col_map.get("actual_consumption_wh")
+        or col_map.get("pred_consumption_wh")
+        or col_map.get("value")
+        or col_map.get("wh")
+    )
+
+    if ts_col is None:
+        raise ValueError(f"Το history CSV πρέπει να έχει στήλη timestamp. Columns: {list(hist.columns)}")
+    if val_col is None:
+        raise ValueError(f"Το history CSV πρέπει να έχει στήλη consumption_Wh. Columns: {list(hist.columns)}")
+
+    hist = hist[[ts_col, val_col]].copy().rename(columns={ts_col: "timestamp", val_col: "consumption_Wh"})
+    hist["timestamp"] = pd.to_datetime(hist["timestamp"], errors="coerce")
+    hist["consumption_Wh"] = pd.to_numeric(hist["consumption_Wh"], errors="coerce")
+    hist = hist.dropna(subset=["timestamp", "consumption_Wh"])
+    hist["consumption_Wh"] = hist["consumption_Wh"].clip(lower=0)
+    hist = hist.sort_values("timestamp").reset_index(drop=True)
+
+    if hist.empty:
+        raise ValueError("Το history CSV δεν περιέχει έγκυρες γραμμές.")
+
+    return hist, str(path)
+
+
+def analyze_history_stability_recommendation(
+    history_csv_file: Any,
+    history_csv_path_text: str,
+    target_date: str,
+    history_correction_days: int,
+    min_history_hours: int,
+    history_consumption_text: str,
+):
     try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            return True
+        history_days = int(history_correction_days or 7)
+        if history_days <= 0:
+            history_days = 7
 
-        js = r.json()
-        hourly = js.get("hourly", {})
+        target_start = pd.Timestamp(_parse_date(target_date))
+        window_start = target_start - pd.Timedelta(days=history_days)
+        expected_hours = history_days * 24
 
-        if external_temperature_24h_text and external_temperature_24h_text.strip():
-            temp_missing_from_meteo = False
+        hist, source = _history_dataframe_from_inputs(
+            history_csv_file=history_csv_file,
+            history_csv_path_text=history_csv_path_text,
+            history_consumption_text=history_consumption_text,
+            target_date=target_date,
+            history_days=history_days,
+        )
+
+        hist = hist[hist["timestamp"] < target_start].copy()
+        window_hist = hist[(hist["timestamp"] >= window_start) & (hist["timestamp"] < target_start)].copy()
+        if window_hist.empty:
+            window_hist = hist.tail(expected_hours).copy()
+        if window_hist.empty:
+            raise ValueError("Δεν υπάρχουν διαθέσιμες ιστορικές τιμές πριν από την target date.")
+
+        window_hist = window_hist.groupby("timestamp", as_index=False).agg({"consumption_Wh": "mean"}).sort_values("timestamp")
+        expected_index = pd.date_range(window_start, target_start - pd.Timedelta(hours=1), freq="h")
+        aligned = window_hist.set_index("timestamp").reindex(expected_index)
+        aligned.index.name = "timestamp"
+        aligned = aligned.reset_index()
+
+        observed_hours = int(aligned["consumption_Wh"].notna().sum())
+        missing_hours = int(aligned["consumption_Wh"].isna().sum())
+        completeness_score = observed_hours / expected_hours if expected_hours > 0 else 0.0
+
+        aligned["consumption_filled_Wh"] = (
+            aligned["consumption_Wh"]
+            .interpolate(method="linear", limit_direction="both")
+            .ffill()
+            .bfill()
+        )
+        if aligned["consumption_filled_Wh"].isna().all():
+            raise ValueError("Δεν μπορεί να υπολογιστεί σταθερότητα: όλες οι τιμές είναι κενές.")
+
+        aligned["date"] = aligned["timestamp"].dt.date
+        aligned["hour"] = aligned["timestamp"].dt.hour
+        aligned["is_weekend"] = (aligned["timestamp"].dt.weekday >= 5).astype(int)
+
+        daily = aligned.groupby("date", as_index=False).agg(
+            daily_kWh=("consumption_filled_Wh", lambda s: float(pd.to_numeric(s, errors="coerce").sum() / 1000.0)),
+            daily_mean_Wh=("consumption_filled_Wh", "mean"),
+            daily_peak_Wh=("consumption_filled_Wh", "max"),
+            observed_hours=("consumption_Wh", lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+            is_weekend=("is_weekend", "max"),
+        )
+
+        daily_kwh_values = pd.to_numeric(daily["daily_kWh"], errors="coerce").dropna()
+        mean_daily_kWh = float(daily_kwh_values.mean()) if not daily_kwh_values.empty else float("nan")
+        median_daily_kWh = float(daily_kwh_values.median()) if not daily_kwh_values.empty else float("nan")
+        min_daily_kWh = float(daily_kwh_values.min()) if not daily_kwh_values.empty else float("nan")
+        max_daily_kWh = float(daily_kwh_values.max()) if not daily_kwh_values.empty else float("nan")
+
+        daily_cv = _safe_cv(daily["daily_kWh"])
+        daily_score = _score_from_cv(daily_cv, cv_bad=0.35)
+
+        pivot = aligned.pivot_table(index="date", columns="hour", values="consumption_filled_Wh", aggfunc="mean")
+        hourly_cvs = []
+        for hour in range(24):
+            if hour in pivot.columns:
+                cv = _safe_cv(pivot[hour])
+                if cv is not None and not pd.isna(cv):
+                    hourly_cvs.append(float(cv))
+        hourly_profile_cv = float(pd.Series(hourly_cvs).median()) if hourly_cvs else None
+        hourly_score = _score_from_cv(hourly_profile_cv, cv_bad=0.75)
+
+        daily["peak_ratio"] = daily["daily_peak_Wh"] / daily["daily_mean_Wh"].replace(0, pd.NA)
+        peak_ratio_cv = _safe_cv(daily["peak_ratio"])
+        peak_score = _score_from_cv(peak_ratio_cv, cv_bad=0.50)
+
+        target_is_weekend = int(target_start.weekday() >= 5)
+        same_type_days = int(daily[daily["is_weekend"] == target_is_weekend]["date"].nunique())
+        if target_is_weekend:
+            day_type_score = 1.0 if same_type_days >= 2 else (0.75 if same_type_days == 1 else 0.50)
         else:
-            temps = hourly.get("temperature_2m")
-            temp_missing_from_meteo = not (isinstance(temps, list) and len(temps) >= 24)
+            day_type_score = 1.0 if same_type_days >= 3 else (0.75 if same_type_days >= 1 else 0.50)
 
-        hums = hourly.get("relative_humidity_2m")
-        hum_missing_from_meteo = not (isinstance(hums, list) and len(hums) >= 24)
+        base_score = 0.30 * daily_score + 0.35 * hourly_score + 0.20 * peak_score + 0.15 * completeness_score
+        stability_score = _clamp01(base_score * (0.85 + 0.15 * day_type_score))
 
-    except Exception:
-        return True
+        if completeness_score < 0.85 or observed_hours < min(int(min_history_hours or expected_hours), expected_hours) * 0.80:
+            recommended_alpha = 0.05
+            category = "Low"
+            alpha_range = "0.00–0.10"
+            reason_alpha = "Το ιστορικό δεν είναι αρκετά πλήρες. Προτείνεται πολύ χαμηλό max_alpha."
+        elif stability_score >= 0.93:
+            recommended_alpha = 0.60
+            category = "Excellent"
+            alpha_range = "0.55–0.65"
+            reason_alpha = "Το ιστορικό είναι εξαιρετικά σταθερό. Επιτρέπεται ισχυρότερη history-aware correction."
+        elif stability_score >= 0.80:
+            recommended_alpha = 0.40
+            category = "Very High"
+            alpha_range = "0.35–0.50"
+            reason_alpha = "Το ιστορικό είναι πολύ σταθερό και επαναλαμβανόμενο."
+        elif stability_score >= 0.60:
+            recommended_alpha = 0.25
+            category = "High"
+            alpha_range = "0.20–0.30"
+            reason_alpha = "Το ιστορικό είναι σταθερό. Προτείνεται μέτρια correction."
+        elif stability_score >= 0.40:
+            recommended_alpha = 0.10
+            category = "Medium"
+            alpha_range = "0.10–0.15"
+            reason_alpha = "Το ιστορικό έχει μέτρια σταθερότητα. Προτείνεται χαμηλό max_alpha."
+        else:
+            recommended_alpha = 0.05
+            category = "Low"
+            alpha_range = "0.00–0.10"
+            reason_alpha = "Το ιστορικό είναι ασταθές ή έχει μη επαναλαμβανόμενα peaks."
 
-    return temp_missing_from_meteo or hum_missing_from_meteo
+        explanation = (
+            f"History source: {source}\n"
+            f"Target date: {target_start.date().isoformat()}\n"
+            f"History window checked: {window_start} έως {target_start} (exclusive)\n"
+            f"Expected hours: {expected_hours} | Observed hours: {observed_hours} | Missing hours: {missing_hours}\n"
+            f"Completeness score: {completeness_score:.3f}\n"
+            f"Mean daily consumption: {mean_daily_kWh:.3f} kWh/day | Median: {median_daily_kWh:.3f} kWh/day\n"
+            f"Daily consumption range: {min_daily_kWh:.3f}–{max_daily_kWh:.3f} kWh/day\n"
+            f"Daily total CV: {daily_cv if daily_cv is not None else float('nan'):.3f} | Daily stability score: {daily_score:.3f}\n"
+            f"Hourly profile median CV: {hourly_profile_cv if hourly_profile_cv is not None else float('nan'):.3f} | Hourly stability score: {hourly_score:.3f}\n"
+            f"Peak-ratio CV: {peak_ratio_cv if peak_ratio_cv is not None else float('nan'):.3f} | Peak stability score: {peak_score:.3f}\n"
+            f"Same day-type days in history: {same_type_days} | Day-type score: {day_type_score:.3f}\n"
+            f"Recommended max_alpha range for category: {alpha_range}\n"
+            f"Recommendation reason: {reason_alpha}"
+        )
 
+        status = (
+            f"✅ History stability analyzed. Category={category}. "
+            f"Recommended max_alpha={recommended_alpha:.2f} (range {alpha_range})."
+        )
+
+        return f"{stability_score:.3f}", category, float(recommended_alpha), explanation, status
+
+    except Exception as exc:
+        return "", "Not available", None, f"Could not analyze history stability: {exc}", "⚠️ History stability recommendation not available."
+
+
+def _reset_history_stability_recommendation(*_):
+    return (
+        "",
+        "Outdated / not analyzed",
+        None,
+        "History stability recommendation is outdated. Click Analyze history stability again.",
+        "History stability recommendation needs refresh.",
+        gr.update(value=False),
+    )
+
+
+# ============================================================
+# BEHAVIORAL ADJUSTMENT
+# ============================================================
 
 def _parse_behavior_hours(text: str) -> List[int]:
     if text is None:
@@ -358,20 +676,17 @@ def _parse_behavior_hours(text: str) -> List[int]:
             start_s, end_s = [x.strip() for x in part.split("-", 1)]
             start = int(start_s)
             end = int(end_s)
-
             if not (0 <= start <= 23 and 0 <= end <= 24):
-                raise ValueError("Τα διαστήματα high consumption πρέπει να είναι μέσα στο 0-24.")
-
+                raise ValueError("Τα διαστήματα πρέπει να είναι μέσα στο 0-24.")
             if end <= start:
                 raise ValueError("Σε κάθε διάστημα πρέπει να ισχύει τέλος > αρχή, π.χ. 18-23.")
-
             for h in range(start, end):
                 if 0 <= h <= 23:
                     hours.add(h)
         else:
             h = int(part)
             if not (0 <= h <= 23):
-                raise ValueError("Οι ώρες high consumption πρέπει να είναι μέσα στο 0-23.")
+                raise ValueError("Οι ώρες πρέπει να είναι μέσα στο 0-23.")
             hours.add(h)
 
     return sorted(hours)
@@ -394,12 +709,69 @@ def _normalize_behavior_inputs(
         raise ValueError("Το behavior factor πρέπει να είναι > 0.")
 
     hours = _parse_behavior_hours(high_consumption_hours_text)
-
     if len(hours) == 0:
         return False, [], 1.0
 
     return True, hours, factor
 
+
+def _apply_behavior_adjustment_single_df(
+    df: pd.DataFrame,
+    hours: List[int],
+    factor: float,
+    value_col: str = "pred_consumption_Wh",
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    out["hour"] = out["timestamp"].dt.hour
+    out["behavior_adjusted"] = out["hour"].isin(hours).astype(int)
+    out["behavior_factor"] = out["behavior_adjusted"].apply(lambda x: factor if x == 1 else 1.0)
+    out[value_col] = out[value_col] * out["behavior_factor"]
+    return out
+
+
+def _apply_behavior_adjustment_curve_df(curve_df: pd.DataFrame, hours: List[int], factor: float, target_cols: List[str]) -> pd.DataFrame:
+    if curve_df is None or curve_df.empty:
+        return curve_df
+
+    out = curve_df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"])
+    out["hour"] = out["timestamp"].dt.hour
+    mask = out["hour"].isin(hours)
+
+    for col in target_cols:
+        if col in out.columns:
+            out.loc[mask, col] = out.loc[mask, col] * factor
+
+    out["behavior_adjusted"] = mask.astype(int)
+    out["behavior_factor"] = out["behavior_adjusted"].apply(lambda x: factor if x == 1 else 1.0)
+    return out
+
+
+def _behavior_summary_suffix(enabled: bool, hours: List[int], factor: float) -> str:
+    if not enabled:
+        return "Behavioral adjustment: OFF"
+
+    if factor > 1:
+        effect = f"increase by {(factor - 1) * 100:.1f}%"
+    elif factor < 1:
+        effect = f"decrease by {(1 - factor) * 100:.1f}%"
+    else:
+        effect = "no change"
+
+    return (
+        "Behavioral adjustment: ON\n"
+        f"Adjusted hours: {hours}\n"
+        f"Behavior factor: {factor:.2f} ({effect})"
+    )
+
+
+# ============================================================
+# ENSEMBLE HELPERS
+# ============================================================
 
 def _resolve_ensemble_weights(
     use_custom_weights: bool,
@@ -424,138 +796,100 @@ def _resolve_ensemble_weights(
     if abs(total - 100.0) > 1e-6:
         raise ValueError(f"Τα ensemble weights πρέπει να αθροίζουν σε 100%. Τρέχον άθροισμα: {total:.2f}%.")
 
-    return {
-        "rf": rf / 100.0,
-        "xgb": xgb / 100.0,
-        "lgbm": lgbm / 100.0,
-    }
+    return {"rf": rf / 100.0, "xgb": xgb / 100.0, "lgbm": lgbm / 100.0}
 
 
 def _weights_text(weights: Dict[str, float]) -> str:
-    return (
-        f"Weights: RF={weights['rf']:.2f}, "
-        f"XGB={weights['xgb']:.2f}, "
-        f"LGBM={weights['lgbm']:.2f}"
-    )
+    return f"Weights: RF={weights['rf']:.2f}, XGB={weights['xgb']:.2f}, LGBM={weights['lgbm']:.2f}"
 
 
-def _day_name_from_index(day_idx: Optional[int]) -> str:
-    names = {
-        0: "Monday",
-        1: "Tuesday",
-        2: "Wednesday",
-        3: "Thursday",
-        4: "Friday",
-        5: "Saturday",
-        6: "Sunday",
+def _comparison_model_ids(mode: str) -> Dict[str, str]:
+    if mode == MODE_WITH_HISTORY:
+        return {
+            "rf": "rf_with_history_optional",
+            "xgb": "xgb_with_history_optional",
+            "lgbm": "lgbm_with_history_default",
+        }
+
+    return {
+        "rf": "rf_no_history_optional",
+        "xgb": "xgb_no_history_optional",
+        "lgbm": "lgbm_no_history_default",
     }
+
+
+# ============================================================
+# SUMMARY / CSV / DISPLAY HELPERS
+# ============================================================
+
+def _flag_yes_no(value: Any) -> str:
     try:
-        return names.get(int(day_idx), "Unknown")
+        return "Yes" if int(value) == 1 else "No"
     except Exception:
         return "Unknown"
 
 
-def _yes_no_flag(v: Any) -> str:
-    try:
-        return "Yes" if int(v) == 1 else "No"
-    except Exception:
-        return "No"
+def _day_type_from_flags(flags: Dict[str, Any]) -> str:
+    is_weekend = int(flags.get("is_weekend", 0) or 0)
+    is_holiday = int(flags.get("is_holiday", 0) or 0)
+    if is_weekend and is_holiday:
+        return "Weekend and Holiday"
+    if is_weekend:
+        return "Weekend"
+    if is_holiday:
+        return "Holiday"
+    return "Working day"
 
 
-def _apply_behavior_adjustment_single_df(
-    df: pd.DataFrame,
-    hours: List[int],
-    factor: float,
-    value_col: str = "pred_consumption_Wh",
-) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    out = df.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"])
-    out["hour"] = out["timestamp"].dt.hour
-    out["behavior_adjusted"] = out["hour"].isin(hours).astype(int)
-    out["behavior_factor"] = out["behavior_adjusted"].apply(lambda x: factor if x == 1 else 1.0)
-    out[value_col] = out[value_col] * out["behavior_factor"]
-    return out
-
-
-def _apply_behavior_adjustment_curve_df(
-    curve_df: pd.DataFrame,
-    hours: List[int],
-    factor: float,
-    target_cols: List[str],
-) -> pd.DataFrame:
-    if curve_df is None or curve_df.empty:
-        return curve_df
-
-    out = curve_df.copy()
-    out["timestamp"] = pd.to_datetime(out["timestamp"])
-    out["hour"] = out["timestamp"].dt.hour
-    mask = out["hour"].isin(hours)
-
-    for col in target_cols:
-        if col in out.columns:
-            out.loc[mask, col] = out.loc[mask, col] * factor
-
-    out["behavior_adjusted"] = mask.astype(int)
-    out["behavior_factor"] = out["behavior_adjusted"].apply(lambda x: factor if x == 1 else 1.0)
-    return out
-
-
-def _behavior_summary_suffix(
-    enabled: bool,
-    hours: List[int],
-    factor: float,
-) -> str:
-    if not enabled:
-        return "Behavioral adjustment: OFF"
-
-    if factor > 1:
-        effect = f"increase by {(factor - 1) * 100:.1f}%"
-    elif factor < 1:
-        effect = f"decrease by {(1 - factor) * 100:.1f}%"
-    else:
-        effect = "no change"
-
+def _flags_summary_line(flags: Dict[str, Any]) -> str:
     return (
-        "Behavioral adjustment: ON\n"
-        f"Adjusted hours: {hours}\n"
-        f"Behavior factor: {factor:.2f} ({effect})"
+        f"Type of day: {_day_type_from_flags(flags)} | "
+        f"Weekend: {_flag_yes_no(flags.get('is_weekend'))} | "
+        f"Holiday: {_flag_yes_no(flags.get('is_holiday'))}"
     )
 
-def _build_summary_single(
-    out: Dict[str, Any],
-    remaining_kwh_today: Optional[float] = None,
-    cutoff_iso: Optional[str] = None,
-    behavior_text: Optional[str] = None,
-) -> str:
+
+def _add_flag_columns_to_df(df: pd.DataFrame, flags: Dict[str, Any]) -> pd.DataFrame:
+    out = df.copy()
+    is_weekend = int(flags.get("is_weekend", 0) or 0)
+    is_holiday = int(flags.get("is_holiday", 0) or 0)
+    out["is_weekend"] = is_weekend
+    out["is_holiday"] = is_holiday
+    out["is_weekend_text"] = _flag_yes_no(is_weekend)
+    out["is_holiday_text"] = _flag_yes_no(is_holiday)
+    out["day_type"] = _day_type_from_flags(flags)
+    return out
+
+
+def _build_summary_single(out: Dict[str, Any], remaining_kwh_today: Optional[float] = None, cutoff_iso: Optional[str] = None, behavior_text: Optional[str] = None) -> str:
+    flags = out.get("derived_flags", {}) or {}
     model_name = out.get("model_name") or out.get("label") or out.get("model_id")
 
-    day_name = _day_name_from_index(out.get("day_of_week"))
-    season = out.get("season", "Unknown")
-    is_weekend = _yes_no_flag(out.get("is_weekend"))
-    is_holiday = _yes_no_flag(out.get("is_holiday"))
-
     lines = [
-        f"Model: {out.get('model_id')} — {model_name}",
-        f"Mode: {out.get('mode')}",
+        f"Requested model: {out.get('requested_model_id')}",
+        f"Resolved model: {out.get('model_id')} — {model_name}",
+        f"Mode: {out.get('mode')} | Optimization: {out.get('optimization')} | Variant: {out.get('prediction_variant')}",
         f"City: {out.get('city_label') or out.get('city')} | Date: {out.get('target_date')}",
-        f"Day: {day_name}",
-        f"Season: {season}",
-        f"Weekend: {is_weekend}",
-        f"Holiday: {is_holiday}",
+        f"Season: {out.get('season')}",
         f"Total kWh/day (24h): {float(out.get('total_kWh_day', 0.0)):.3f}",
-        f"Weather source: {out.get('weather_source')}",
-        f"Internal temp source: {out.get('internal_temperature_source')}",
-        f"Internal humidity source: {out.get('internal_humidity_source')}",
-        f"External humidity source: {out.get('external_humidity_source')}",
-        f"History source: {out.get('history_source')}",
-        f"History store path: {out.get('history_store_path')}",
     ]
 
     if remaining_kwh_today is not None and cutoff_iso is not None:
         lines.append(f"Remaining kWh (from {cutoff_iso}): {float(remaining_kwh_today):.3f}")
+
+    lines += [
+        f"Weather source: {out.get('weather_source')}",
+        f"External humidity source: {out.get('external_humidity_source')}",
+        f"Internal temperature source: {out.get('internal_temperature_source')}",
+        f"Internal humidity source: {out.get('internal_humidity_source')}",
+        f"History source: {out.get('history_source')}",
+        f"History hours used: {out.get('history_hours_used')}",
+        f"History CSV path: {out.get('history_csv_path')}",
+        f"Legacy history store path: {out.get('history_store_path')}",
+        f"History correction applied: {out.get('history_correction_applied')}",
+        f"History correction reason: {out.get('history_correction_reason')}",
+        _flags_summary_line(flags),
+    ]
 
     if behavior_text:
         lines += ["", behavior_text]
@@ -563,35 +897,22 @@ def _build_summary_single(
     return "\n".join(lines)
 
 
-def _build_summary_compare(
-    results: Dict[str, Dict[str, Any]],
-    remaining_map: Dict[str, Optional[float]],
-    cutoff_map: Dict[str, Optional[str]],
-    behavior_text: Optional[str] = None,
-) -> str:
+def _build_summary_compare(results: Dict[str, Dict[str, Any]], remaining_map: Dict[str, Optional[float]], cutoff_map: Dict[str, Optional[str]], behavior_text: Optional[str] = None) -> str:
     first = next(iter(results.values()))
-
-    day_name = _day_name_from_index(first.get("day_of_week"))
-    season = first.get("season", "Unknown")
-    is_weekend = _yes_no_flag(first.get("is_weekend"))
-    is_holiday = _yes_no_flag(first.get("is_holiday"))
-
+    flags = first.get("derived_flags", {}) or {}
     lines = [
         f"City: {first.get('city_label') or first.get('city')} | Date: {first.get('target_date')}",
-        f"Mode: {first.get('mode')}",
-        f"Day: {day_name}",
-        f"Season: {season}",
-        f"Weekend: {is_weekend}",
-        f"Holiday: {is_holiday}",
+        f"Mode: {first.get('mode')} | Optimization: {first.get('optimization')}",
+        _flags_summary_line(flags),
         "Model comparison:",
     ]
 
-    for mid, out in results.items():
-        model_name = out.get("model_name") or out.get("label") or mid
+    for key, out in results.items():
+        model_name = out.get("model_name") or out.get("label") or out.get("model_id")
         total_kwh = float(out.get("total_kWh_day", 0.0))
-        rem = remaining_map.get(mid)
-        cutoff = cutoff_map.get(mid)
-        row = f"- {mid} — {model_name}: Total kWh/day (24h) = {total_kwh:.3f}"
+        rem = remaining_map.get(key)
+        cutoff = cutoff_map.get(key)
+        row = f"- {key.upper()} | {out.get('model_id')} — {model_name}: Total kWh/day = {total_kwh:.3f}"
         if rem is not None and cutoff is not None:
             row += f" | Remaining from {cutoff} = {float(rem):.3f}"
         lines.append(row)
@@ -602,29 +923,13 @@ def _build_summary_compare(
     return "\n".join(lines)
 
 
-def _build_summary_combined(
-    total_kwh_day: float,
-    remaining_kwh_today: Optional[float],
-    cutoff_iso: Optional[str],
-    city: str,
-    target_date: str,
-    mode: str,
-    weights: Dict[str, float],
-    day_name: str = "Unknown",
-    season: str = "Unknown",
-    is_weekend: str = "No",
-    is_holiday: str = "No",
-    behavior_text: Optional[str] = None,
-) -> str:
+def _build_summary_combined(total_kwh_day: float, remaining_kwh_today: Optional[float], cutoff_iso: Optional[str], city: str, target_date: str, mode: str, optimization: str, weights: Dict[str, float], flags: Optional[Dict[str, Any]] = None, behavior_text: Optional[str] = None) -> str:
+    flags = flags or {}
     lines = [
         "Combined prediction (weighted ensemble):",
-        f"Mode: {mode}",
-        f"City: {city}",
-        f"Date: {target_date}",
-        f"Day: {day_name}",
-        f"Season: {season}",
-        f"Weekend: {is_weekend}",
-        f"Holiday: {is_holiday}",
+        f"Mode: {mode} | Optimization: {optimization}",
+        f"City: {city} | Date: {target_date}",
+        _flags_summary_line(flags),
         f"Total kWh/day (24h): {float(total_kwh_day):.3f}",
         _weights_text(weights),
     ]
@@ -638,130 +943,13 @@ def _build_summary_combined(
     return "\n".join(lines)
 
 
-def _meteo24_to_df(
-    temps24: Optional[List[float]],
-    hum24: Optional[List[float]],
-) -> pd.DataFrame:
-    if (
-        temps24 is None or len(temps24) != 24 or
-        hum24 is None or len(hum24) != 24
-    ):
+def _meteo24_to_df(temps24: Optional[List[float]], hum24: Optional[List[float]]) -> pd.DataFrame:
+    if temps24 is None or len(temps24) != 24:
         return pd.DataFrame()
-
-    return pd.DataFrame(
-        {
-            "hour": list(range(24)),
-            "external_temp_C": [float(x) for x in temps24],
-            "external_humidity_pct": [float(x) for x in hum24],
-        }
-    )
-
-
-def _save_csv_full_day(
-    out: Dict[str, Any],
-    preds_full: pd.DataFrame,
-    temps24: Optional[List[float]],
-    hum24: Optional[List[float]],
-    remaining_kwh_today: Optional[float],
-    cutoff_iso: Optional[str],
-) -> Path:
-    df = preds_full.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    if temps24 is not None and len(temps24) == 24 and len(df) == 24:
-        df["external_temp_C"] = [float(x) for x in temps24]
-    else:
-        df["external_temp_C"] = pd.NA
-
-    if hum24 is not None and len(hum24) == 24 and len(df) == 24:
-        df["external_humidity_pct"] = [float(x) for x in hum24]
-    else:
-        df["external_humidity_pct"] = pd.NA
-
-    df["model_id"] = out.get("model_id")
-    df["model_name"] = out.get("model_name") or out.get("label")
-    df["model_type"] = out.get("model_type")
-    df["mode"] = out.get("mode")
-    df["city"] = out.get("city")
-    df["city_label"] = out.get("city_label")
-    df["target_date"] = out.get("target_date")
-    df["day_of_week"] = out.get("day_of_week")
-    df["season"] = out.get("season")
-    df["is_weekend"] = out.get("is_weekend")
-    df["is_holiday"] = out.get("is_holiday")
-    df["weather_source"] = out.get("weather_source")
-    df["external_humidity_source"] = out.get("external_humidity_source")
-    df["history_source"] = out.get("history_source")
-    df["history_store_path"] = out.get("history_store_path")
-    df["history_window_start"] = out.get("history_window_start")
-    df["history_window_end"] = out.get("history_window_end")
-    df["total_kWh_day"] = out.get("total_kWh_day")
-    df["remaining_kWh_today"] = remaining_kwh_today if remaining_kwh_today is not None else pd.NA
-    df["cutoff_iso"] = cutoff_iso if cutoff_iso is not None else pd.NA
-
-    safe_city = str(out.get("city", "city")).replace(" ", "_")
-    safe_date = str(out.get("target_date", "date"))
-    safe_mid = str(out.get("model_id", "model"))
-    safe_mode = str(out.get("mode", "mode"))
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    fp = UI_EXPORT_DIR / f"ui_pred_{safe_mid}_{safe_mode}_{safe_city}_{safe_date}_{ts}.csv"
-    df.to_csv(fp, index=False, encoding="utf-8")
-    return fp
-
-
-def _save_csv_combined(
-    city: str,
-    target_date: str,
-    mode: str,
-    curve_df: pd.DataFrame,
-    temps24: Optional[List[float]],
-    hum24: Optional[List[float]],
-    remaining_kwh_today: Optional[float],
-    cutoff_iso: Optional[str],
-    weights: Dict[str, float],
-    day_of_week: Optional[int] = None,
-    season: Optional[str] = None,
-    is_weekend: Optional[int] = None,
-    is_holiday: Optional[int] = None,
-) -> Path:
-    df = curve_df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    if temps24 is not None and len(temps24) == 24 and len(df) == 24:
-        df["external_temp_C"] = [float(x) for x in temps24]
-    else:
-        df["external_temp_C"] = pd.NA
-
-    if hum24 is not None and len(hum24) == 24 and len(df) == 24:
-        df["external_humidity_pct"] = [float(x) for x in hum24]
-    else:
-        df["external_humidity_pct"] = pd.NA
-
-    df["model_id"] = "combined"
-    df["model_name"] = "Weighted Ensemble"
-    df["model_type"] = "ensemble"
-    df["mode"] = mode
-    df["city"] = city
-    df["target_date"] = target_date
-    df["day_of_week"] = day_of_week if day_of_week is not None else pd.NA
-    df["season"] = season if season is not None else pd.NA
-    df["is_weekend"] = is_weekend if is_weekend is not None else pd.NA
-    df["is_holiday"] = is_holiday if is_holiday is not None else pd.NA
-    df["ensemble_weight_rf"] = weights["rf"]
-    df["ensemble_weight_xgb"] = weights["xgb"]
-    df["ensemble_weight_lgbm"] = weights["lgbm"]
-    df["total_kWh_day"] = float(df["ensemble_Wh"].sum() / 1000.0)
-    df["remaining_kWh_today"] = remaining_kwh_today if remaining_kwh_today is not None else pd.NA
-    df["cutoff_iso"] = cutoff_iso if cutoff_iso is not None else pd.NA
-
-    safe_city = str(city).replace(" ", "_")
-    safe_date = str(target_date)
-    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    fp = UI_EXPORT_DIR / f"ui_pred_combined_{mode}_{safe_city}_{safe_date}_{ts}.csv"
-    df.to_csv(fp, index=False, encoding="utf-8")
-    return fp
+    out = {"hour": list(range(24)), "external_temp_C": [float(x) for x in temps24]}
+    if hum24 is not None and len(hum24) == 24:
+        out["external_humidity_pct"] = [float(x) for x in hum24]
+    return pd.DataFrame(out)
 
 
 def _compute_remaining_kwh_today(df_full: pd.DataFrame, target_date: str) -> Tuple[Optional[float], Optional[str]]:
@@ -776,8 +964,7 @@ def _compute_remaining_kwh_today(df_full: pd.DataFrame, target_date: str) -> Tup
     if df_full is None or df_full.empty or "timestamp" not in df_full.columns or "pred_consumption_Wh" not in df_full.columns:
         return None, None
 
-    now = _now_local()
-    cutoff = _next_full_hour(now)
+    cutoff = _next_full_hour(_now_local())
     cutoff_iso = cutoff.isoformat()
 
     df_tmp = df_full.copy()
@@ -787,39 +974,14 @@ def _compute_remaining_kwh_today(df_full: pd.DataFrame, target_date: str) -> Tup
     if df_tmp.empty:
         return 0.0, cutoff_iso
 
-    remaining_kwh = float(df_tmp["pred_consumption_Wh"].sum() / 1000.0)
-    return remaining_kwh, cutoff_iso
+    return float(df_tmp["pred_consumption_Wh"].sum() / 1000.0), cutoff_iso
 
 
-def _compute_remaining_kwh_today_for_col(
-    df_full: pd.DataFrame,
-    target_date: str,
-    value_col: str,
-) -> Tuple[Optional[float], Optional[str]]:
-    try:
-        d = _parse_date(target_date)
-    except Exception:
+def _compute_remaining_kwh_today_for_col(df_full: pd.DataFrame, target_date: str, value_col: str) -> Tuple[Optional[float], Optional[str]]:
+    if df_full is None or df_full.empty or value_col not in df_full.columns:
         return None, None
-
-    if d != _today_date():
-        return None, None
-
-    if df_full is None or df_full.empty or "timestamp" not in df_full.columns or value_col not in df_full.columns:
-        return None, None
-
-    now = _now_local()
-    cutoff = _next_full_hour(now)
-    cutoff_iso = cutoff.isoformat()
-
-    df_tmp = df_full.copy()
-    df_tmp["timestamp"] = pd.to_datetime(df_tmp["timestamp"])
-    df_tmp = df_tmp[df_tmp["timestamp"] >= cutoff]
-
-    if df_tmp.empty:
-        return 0.0, cutoff_iso
-
-    remaining_kwh = float(df_tmp[value_col].sum() / 1000.0)
-    return remaining_kwh, cutoff_iso
+    tmp = df_full.rename(columns={value_col: "pred_consumption_Wh"})[["timestamp", "pred_consumption_Wh"]].copy()
+    return _compute_remaining_kwh_today(tmp, target_date)
 
 
 def _filter_today_for_display(df_show: pd.DataFrame, meteo_df_show: pd.DataFrame, target_date: str):
@@ -832,7 +994,6 @@ def _filter_today_for_display(df_show: pd.DataFrame, meteo_df_show: pd.DataFrame
                 meteo_df_show = meteo_df_show[meteo_df_show["hour"] >= cutoff.hour].copy()
     except Exception:
         pass
-
     return df_show, meteo_df_show
 
 
@@ -844,9 +1005,121 @@ def _filter_today_curve_only(df_show: pd.DataFrame, target_date: str):
             df_show = df_show[df_show["timestamp"] >= cutoff].copy()
     except Exception:
         pass
-
     return df_show
 
+
+def _save_csv_full_day(out: Dict[str, Any], preds_full: pd.DataFrame, temps24: Optional[List[float]], hum24: Optional[List[float]], remaining_kwh_today: Optional[float], cutoff_iso: Optional[str]) -> Path:
+    df = preds_full.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    if temps24 is not None and len(temps24) == 24 and len(df) == 24:
+        df["external_temp_C"] = [float(x) for x in temps24]
+    else:
+        df["external_temp_C"] = pd.NA
+
+    if hum24 is not None and len(hum24) == 24 and len(df) == 24:
+        df["external_humidity_pct"] = [float(x) for x in hum24]
+    else:
+        df["external_humidity_pct"] = pd.NA
+
+    for key in [
+        "requested_model_id", "model_id", "model_name", "model_type", "mode", "optimization",
+        "prediction_variant", "city", "city_label", "target_date", "weather_source",
+        "external_humidity_source", "history_source", "history_csv_path", "history_store_path",
+        "history_window_start", "history_window_end", "history_hours_used",
+        "history_correction_applied", "history_correction_reason", "total_kWh_day",
+    ]:
+        df[key] = out.get(key)
+
+    df = _add_flag_columns_to_df(df, out.get("derived_flags", {}) or {})
+    df["remaining_kWh_today"] = remaining_kwh_today if remaining_kwh_today is not None else pd.NA
+    df["cutoff_iso"] = cutoff_iso if cutoff_iso is not None else pd.NA
+
+    safe_city = str(out.get("city", "city")).replace(" ", "_")
+    safe_date = str(out.get("target_date", "date"))
+    safe_mid = str(out.get("model_id", "model"))
+    safe_mode = str(out.get("mode", "mode"))
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fp = UI_EXPORT_DIR / f"ui_pred_{safe_mid}_{safe_mode}_{safe_city}_{safe_date}_{ts}.csv"
+    df.to_csv(fp, index=False, encoding="utf-8")
+    return fp
+
+
+def _save_csv_compare(city: str, target_date: str, mode: str, optimization: str, curve_df: pd.DataFrame, comparison_df: pd.DataFrame, temps24: Optional[List[float]], hum24: Optional[List[float]], flags: Optional[Dict[str, Any]] = None) -> Path:
+    flags = flags or {}
+    curve = curve_df.copy()
+    curve["timestamp"] = pd.to_datetime(curve["timestamp"])
+
+    if temps24 is not None and len(temps24) == 24 and len(curve) == 24:
+        curve["external_temp_C"] = [float(x) for x in temps24]
+    else:
+        curve["external_temp_C"] = pd.NA
+
+    if hum24 is not None and len(hum24) == 24 and len(curve) == 24:
+        curve["external_humidity_pct"] = [float(x) for x in hum24]
+    else:
+        curve["external_humidity_pct"] = pd.NA
+
+    curve = _add_flag_columns_to_df(curve, flags)
+    curve["mode"] = mode
+    curve["optimization"] = optimization
+    curve["city"] = city
+    curve["target_date"] = target_date
+
+    if comparison_df is not None and not comparison_df.empty:
+        for _, row in comparison_df.iterrows():
+            key = str(row.get("model_key", "")).strip()
+            if key:
+                curve[f"total_kWh_day_{key}"] = row.get("total_kWh_day")
+
+    safe_city = str(city).replace(" ", "_")
+    safe_date = str(target_date)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fp = UI_EXPORT_DIR / f"ui_pred_compare_{mode}_{safe_city}_{safe_date}_{ts}.csv"
+    curve.to_csv(fp, index=False, encoding="utf-8")
+    return fp
+
+
+def _save_csv_combined(city: str, target_date: str, mode: str, optimization: str, curve_df: pd.DataFrame, temps24: Optional[List[float]], hum24: Optional[List[float]], remaining_kwh_today: Optional[float], cutoff_iso: Optional[str], weights: Dict[str, float], flags: Optional[Dict[str, Any]] = None) -> Path:
+    df = curve_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    if temps24 is not None and len(temps24) == 24 and len(df) == 24:
+        df["external_temp_C"] = [float(x) for x in temps24]
+    else:
+        df["external_temp_C"] = pd.NA
+
+    if hum24 is not None and len(hum24) == 24 and len(df) == 24:
+        df["external_humidity_pct"] = [float(x) for x in hum24]
+    else:
+        df["external_humidity_pct"] = pd.NA
+
+    df = _add_flag_columns_to_df(df, flags or {})
+    df["model_id"] = "combined"
+    df["model_name"] = "Weighted Ensemble"
+    df["model_type"] = "ensemble"
+    df["mode"] = mode
+    df["optimization"] = optimization
+    df["city"] = city
+    df["target_date"] = target_date
+    df["ensemble_weight_rf"] = weights["rf"]
+    df["ensemble_weight_xgb"] = weights["xgb"]
+    df["ensemble_weight_lgbm"] = weights["lgbm"]
+    df["total_kWh_day"] = float(df["ensemble_Wh"].sum() / 1000.0)
+    df["remaining_kWh_today"] = remaining_kwh_today if remaining_kwh_today is not None else pd.NA
+    df["cutoff_iso"] = cutoff_iso if cutoff_iso is not None else pd.NA
+
+    safe_city = str(city).replace(" ", "_")
+    safe_date = str(target_date)
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fp = UI_EXPORT_DIR / f"ui_pred_combined_{mode}_{safe_city}_{safe_date}_{ts}.csv"
+    df.to_csv(fp, index=False, encoding="utf-8")
+    return fp
+
+
+# ============================================================
+# CHARTS
+# ============================================================
 
 def _build_single_chart(df_show: pd.DataFrame):
     if df_show is None or df_show.empty:
@@ -854,7 +1127,6 @@ def _build_single_chart(df_show: pd.DataFrame):
 
     df = df_show.copy()
     df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-
     hours = list(range(24))
     base = pd.DataFrame({"hour": hours})
     plot_df = base.merge(df[["hour", "pred_consumption_Wh"]], on="hour", how="left")
@@ -862,33 +1134,15 @@ def _build_single_chart(df_show: pd.DataFrame):
 
     fig = plt.figure(figsize=(10, 4))
     ax = fig.add_subplot(111)
-
-    ax.plot(
-        plot_df["hour"],
-        y,
-        linewidth=2.5,
-        marker="o",
-        markersize=4,
-        label="Prediction",
-    )
-
+    ax.plot(plot_df["hour"], y, linewidth=2.5, marker="o", markersize=4, label="Prediction")
     if y.notna().any():
-        avg = y.mean()
-        ax.axhline(
-            avg,
-            linestyle="--",
-            linewidth=1,
-            color="gray",
-            label="Daily average",
-        )
-
+        ax.axhline(y.mean(), linestyle="--", linewidth=1, label="Daily average")
     ax.set_xticks(hours)
     ax.set_xlabel("Hour of day")
     ax.set_ylabel("Predicted consumption (Wh)")
     ax.set_title("Predicted hourly electricity consumption")
     ax.grid(alpha=0.3)
     ax.legend()
-
     return fig
 
 
@@ -898,27 +1152,18 @@ def _build_compare_chart(curve_df: pd.DataFrame):
 
     df = curve_df.copy()
     df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-
     hours = list(range(24))
     base = pd.DataFrame({"hour": hours})
 
     fig = plt.figure(figsize=(10, 4))
     ax = fig.add_subplot(111)
-
     for col in df.columns:
-        if col in ["timestamp", "hour"]:
+        if col in ["timestamp", "hour", "behavior_adjusted", "behavior_factor"]:
             continue
-
+        if not col.endswith("_Wh"):
+            continue
         temp = base.merge(df[["hour", col]], on="hour", how="left")
-
-        ax.plot(
-            temp["hour"],
-            temp[col],
-            linewidth=2,
-            marker="o",
-            markersize=4,
-            label=col.replace("_Wh", "").upper(),
-        )
+        ax.plot(temp["hour"], temp[col], linewidth=2, marker="o", markersize=4, label=col.replace("_Wh", "").upper())
 
     ax.set_xticks(hours)
     ax.set_xlabel("Hour of day")
@@ -926,35 +1171,55 @@ def _build_compare_chart(curve_df: pd.DataFrame):
     ax.set_title("Model comparison — hourly electricity prediction")
     ax.grid(alpha=0.3)
     ax.legend()
-
     return fig
 
+
+# ============================================================
+# PAYLOAD / API CALLS
+# ============================================================
 
 def _prepare_payload(
     use_history: bool,
     model_choice: str,
+    optimization: str,
     city: str,
     target_date: str,
     internal_temperature_24h_text: str,
     external_temperature_24h_text: str,
     internal_humidity_24h_text: str,
+    external_humidity_24h_text: str,
     t_min: Optional[float],
     t_max: Optional[float],
     num_rooms: float,
     residents: float,
+    num_adults: Optional[float],
+    num_children: Optional[float],
+    num_elderly: Optional[float],
+    has_ac: float,
+    has_fridge_freezer: float,
     has_dryer: float,
     has_washing_machine: float,
     has_dishwasher: float,
     has_microwave: float,
+    has_electric_oven: float,
+    has_electric_hob: float,
+    solar_panels: float,
     building_type: str,
     build_era: str,
+    income_band: str,
     heating_type: str,
     water_heater_type: str,
+    homeowner_status: str,
     years_in_house: str,
-    use_proxy_history: bool,
+    occupation: str,
+    history_csv_file: Any,
+    history_csv_path_text: str,
+    use_default_history_store: bool,
     min_history_hours: int,
     history_consumption_text: str,
-    external_humidity_constant: Optional[float],
+    apply_history_correction: bool,
+    history_correction_days: int,
+    history_correction_max_alpha: float,
 ):
     t_min, t_max = _normalize_temp_inputs(t_min, t_max)
 
@@ -969,107 +1234,103 @@ def _prepare_payload(
     if err:
         raise ValueError(err)
 
+    model_id = _choice_to_model_id(model_choice)
+    mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
+    history_csv_path = _resolve_history_csv_path(history_csv_file, history_csv_path_text)
+
+    if num_adults is None:
+        num_adults = residents
+    if num_children is None:
+        num_children = 0.0
+    if num_elderly is None:
+        num_elderly = 0.0
+
     for name, val in {
+        "has_ac": has_ac,
+        "has_fridge_freezer": has_fridge_freezer,
         "has_dryer": has_dryer,
         "has_washing_machine": has_washing_machine,
         "has_dishwasher": has_dishwasher,
         "has_microwave": has_microwave,
+        "has_electric_oven": has_electric_oven,
+        "has_electric_hob": has_electric_hob,
+        "solar_panels": solar_panels,
     }.items():
         if float(val) not in (0.0, 1.0):
             raise ValueError(f"Σφάλμα: το {name} πρέπει να είναι 0 ή 1.")
 
-    model_id = _choice_to_model_id(model_choice)
-    mode = "withhistory" if use_history else "coldstart"
-
-    internal_temperature_24h = _parse_optional_float_list_24(
-        internal_temperature_24h_text, "internal_temperature_24h"
-    )
-    internal_humidity_24h = _parse_optional_float_list_24(
-        internal_humidity_24h_text, "internal_humidity_24h"
-    )
-
-    external_humidity_24h = _fetch_openmeteo_hourly_external_humidity(city, target_date)
-    external_humidity_source_ui = "openmeteo_forecast"
-
-    if external_humidity_24h is None:
-        if external_humidity_constant is None:
-            raise ValueError(
-                "Σφάλμα: απαιτείται fallback external humidity (%) όταν δεν υπάρχουν δεδομένα από Open-Meteo."
-            )
-        try:
-            eh = float(external_humidity_constant)
-        except Exception:
-            raise ValueError("Σφάλμα: η fallback τιμή external humidity πρέπει να είναι αριθμός.")
-        external_humidity_24h = _build_external_humidity_profile_from_mean(eh)
-        external_humidity_source_ui = "user_mean_profile_24h"
-
     payload: Dict[str, Any] = {
         "model_id": model_id,
         "mode": mode,
+        "optimization": optimization,
         "city": city,
         "target_date": target_date,
         "num_rooms": float(num_rooms),
         "residents": float(residents),
-        "num_adults": float(residents),
-        "num_children": 0.0,
-        "num_elderly": 0.0,
-        "has_ac": 1.0,
-        "has_fridge_freezer": 1.0,
+        "num_adults": float(num_adults),
+        "num_children": float(num_children),
+        "num_elderly": float(num_elderly),
+        "has_ac": float(has_ac),
+        "has_fridge_freezer": float(has_fridge_freezer),
         "has_dryer": float(has_dryer),
         "has_washing_machine": float(has_washing_machine),
         "has_dishwasher": float(has_dishwasher),
         "has_microwave": float(has_microwave),
-        "has_electric_oven": 1.0,
-        "has_electric_hob": 1.0,
-        "solar_panels": 0.0,
+        "has_electric_oven": float(has_electric_oven),
+        "has_electric_hob": float(has_electric_hob),
+        "solar_panels": float(solar_panels),
         "building_type": str(building_type),
         "build_era": str(build_era),
-        "income_band": "Unknown",
+        "income_band": str(income_band),
         "heating_type": str(heating_type),
         "water_heater_type": str(water_heater_type),
+        "homeowner_status": str(homeowner_status),
         "years_in_house": str(years_in_house),
+        "occupation": str(occupation),
         "save_csv": False,
-        "use_proxy_history": bool(use_proxy_history),
         "min_history_hours": int(min_history_hours),
-        "external_humidity_24h": external_humidity_24h,
     }
+
+    internal_temperature_24h = _parse_csv_float_list(internal_temperature_24h_text, "internal_temperature_24h", expected_len=24)
+    external_temperature_24h = _parse_csv_float_list(external_temperature_24h_text, "external_temperature_24h", expected_len=24)
+    internal_humidity_24h = _parse_csv_float_list(internal_humidity_24h_text, "internal_humidity_24h", expected_len=24)
+    external_humidity_24h = _parse_csv_float_list(external_humidity_24h_text, "external_humidity_24h", expected_len=24)
 
     if internal_temperature_24h is not None:
         payload["internal_temperature_24h"] = internal_temperature_24h
-
+    if external_temperature_24h is not None:
+        payload["external_temperature_24h"] = external_temperature_24h
+    elif t_min is not None and t_max is not None:
+        payload["t_min"] = float(t_min)
+        payload["t_max"] = float(t_max)
     if internal_humidity_24h is not None:
         payload["internal_humidity_24h"] = internal_humidity_24h
+    if external_humidity_24h is not None:
+        payload["external_humidity_24h"] = external_humidity_24h
 
-    temps24_user: Optional[List[float]] = None
+    history_vals = _parse_csv_float_list(history_consumption_text, "history_consumption_Wh", expected_len=None)
+    if use_history:
+        payload["apply_history_correction"] = bool(apply_history_correction)
+        payload["history_correction_days"] = int(history_correction_days)
+        payload["history_correction_max_alpha"] = float(history_correction_max_alpha)
 
-    if external_temperature_24h_text and external_temperature_24h_text.strip():
-        vals = _parse_float_list_24(external_temperature_24h_text, "external_temperature_24h")
-        payload["external_temperature_24h"] = vals
-        temps24_user = vals
-    else:
-        if t_min is not None and t_max is not None:
-            payload["t_min"] = float(t_min)
-            payload["t_max"] = float(t_max)
+        if history_vals is not None:
+            payload["history_consumption_Wh"] = history_vals
+            payload["use_default_history_store"] = False
+            payload["use_proxy_history"] = False
+        elif history_csv_path:
+            payload["history_csv_path"] = history_csv_path
+            payload["use_default_history_store"] = False
+            payload["use_proxy_history"] = False
+        else:
+            payload["use_default_history_store"] = bool(use_default_history_store)
+            payload["use_proxy_history"] = bool(use_default_history_store)
 
-    if history_consumption_text and history_consumption_text.strip():
-        try:
-            hvals = [float(x.strip()) for x in history_consumption_text.split(",")]
-        except Exception:
-            raise ValueError("Σφάλμα: history_consumption_Wh δεν είναι έγκυρη λίστα αριθμών (comma-separated).")
-        payload["history_consumption_Wh"] = hvals
-
-    return payload, temps24_user, external_humidity_24h, external_humidity_source_ui
+    return payload, external_temperature_24h, external_humidity_24h
 
 
-def _run_single_model(
-    payload: Dict[str, Any],
-    temps24_user: Optional[List[float]],
-    hum24_user: Optional[List[float]],
-    target_date: str,
-    save_csv: bool,
-):
+def _post_predict(payload: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(f"{API_BASE}/predict", json=payload, timeout=TIMEOUT)
-
     if r.status_code != 200:
         detail = ""
         try:
@@ -1080,75 +1341,67 @@ def _run_single_model(
 
         if r.status_code == 422 and _needs_weather_fallback(detail):
             raise RuntimeError(f"WEATHER_FALLBACK::{detail}")
-
         raise RuntimeError(f"API error ({r.status_code}): {detail}")
+    return r.json()
 
-    out = r.json()
+
+def _predictions_to_df(out: Dict[str, Any]) -> pd.DataFrame:
     preds = out.get("predictions", []) or []
+    df = pd.DataFrame(preds)
+    if not df.empty:
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
 
-    df_full = pd.DataFrame(preds)
-    if not df_full.empty:
-        df_full["timestamp"] = pd.to_datetime(df_full["timestamp"])
-        df_full = df_full.sort_values("timestamp").reset_index(drop=True)
 
-    temps24 = out.get("external_temperature_24h")
-    if temps24 is None:
-        temps24 = temps24_user
-
-    hum24 = out.get("external_humidity_24h")
-    if hum24 is None:
-        hum24 = hum24_user
-
-    meteo_df_full = _meteo24_to_df(temps24, hum24)
-
-    remaining_kwh_today, cutoff_iso = _compute_remaining_kwh_today(df_full, target_date)
-
-    df_show = df_full.copy()
-    meteo_df_show = meteo_df_full.copy()
-    df_show, meteo_df_show = _filter_today_for_display(df_show, meteo_df_show, target_date)
-
-    summary = _build_summary_single(out, remaining_kwh_today=remaining_kwh_today, cutoff_iso=cutoff_iso)
-
-    status = "✅ Done"
-    if save_csv and not df_full.empty:
-        fp = _save_csv_full_day(
-            out=out,
-            preds_full=df_full,
-            temps24=temps24,
-            hum24=hum24,
-            remaining_kwh_today=remaining_kwh_today,
-            cutoff_iso=cutoff_iso,
-        )
-        status = f"✅ Saved CSV (24h): {fp}"
-
-    return summary, df_show, meteo_df_show, status, out, hum24
-
+# ============================================================
+# BUTTON ACTIONS
+# ============================================================
 
 def do_predict(
     use_history: bool,
     model_choice: str,
+    optimization: str,
     city: str,
     target_date: str,
     internal_temperature_24h_text: str,
     external_temperature_24h_text: str,
     internal_humidity_24h_text: str,
+    external_humidity_24h_text: str,
     t_min: Optional[float],
     t_max: Optional[float],
     num_rooms: float,
     residents: float,
+    num_adults: Optional[float],
+    num_children: Optional[float],
+    num_elderly: Optional[float],
+    has_ac: float,
+    has_fridge_freezer: float,
     has_dryer: float,
     has_washing_machine: float,
     has_dishwasher: float,
     has_microwave: float,
+    has_electric_oven: float,
+    has_electric_hob: float,
+    solar_panels: float,
     building_type: str,
     build_era: str,
+    income_band: str,
     heating_type: str,
     water_heater_type: str,
+    homeowner_status: str,
     years_in_house: str,
-    use_proxy_history: bool,
+    occupation: str,
+    history_csv_file: Any,
+    history_csv_path_text: str,
+    use_default_history_store: bool,
     min_history_hours: int,
     history_consumption_text: str,
-    external_humidity_constant: Optional[float],
+    apply_history_correction: bool,
+    history_correction_days: int,
+    history_correction_max_alpha: float,
+    use_recommended_history_alpha: bool,
+    recommended_history_correction_max_alpha: Optional[float],
     enable_behavior_adjustment: bool,
     high_consumption_hours_text: str,
     behavior_factor: Optional[float],
@@ -1159,231 +1412,115 @@ def do_predict(
     save_csv: bool,
 ):
     try:
-        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(
-            enable_behavior_adjustment,
-            high_consumption_hours_text,
-            behavior_factor,
+        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(enable_behavior_adjustment, high_consumption_hours_text, behavior_factor)
+        effective_alpha = _resolve_effective_history_alpha(use_history, use_recommended_history_alpha, recommended_history_correction_max_alpha, history_correction_max_alpha)
+
+        payload, temps24_user, hum24_user = _prepare_payload(
+            use_history, model_choice, optimization, city, target_date,
+            internal_temperature_24h_text, external_temperature_24h_text,
+            internal_humidity_24h_text, external_humidity_24h_text,
+            t_min, t_max, num_rooms, residents, num_adults, num_children, num_elderly,
+            has_ac, has_fridge_freezer, has_dryer, has_washing_machine, has_dishwasher,
+            has_microwave, has_electric_oven, has_electric_hob, solar_panels,
+            building_type, build_era, income_band, heating_type, water_heater_type,
+            homeowner_status, years_in_house, occupation, history_csv_file, history_csv_path_text,
+            use_default_history_store, min_history_hours, history_consumption_text,
+            apply_history_correction, history_correction_days, effective_alpha,
         )
 
-        need_full_weather_fallback = _check_needed_fallback_inputs(
-            city=city,
-            target_date=target_date,
-            external_temperature_24h_text=external_temperature_24h_text,
-        )
-
-        if need_full_weather_fallback:
-            missing = []
-            tmin_ok = t_min is not None
-            tmax_ok = t_max is not None
-            hum_ok = external_humidity_constant is not None
-
-            if not (tmin_ok and tmax_ok):
-                missing.append("t_min και t_max")
-            if not hum_ok:
-                missing.append("external humidity (%)")
-
-            if missing:
-                return (
-                    "⚠️ Δεν βρέθηκαν πλήρη εξωτερικά μετεωρολογικά δεδομένα από το Open-Meteo.\n"
-                    "Για τη συγκεκριμένη ημερομηνία πρέπει να συμπληρώσεις ΟΛΑ τα fallback πεδία:\n"
-                    "- t_min\n"
-                    "- t_max\n"
-                    "- external mean humidity (%)",
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    None,
-                    f"Λείπουν: {', '.join(missing)}",
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                )
-
-        payload, temps24_user, hum24_user, _hum_source_ui = _prepare_payload(
-            use_history,
-            model_choice,
-            city,
-            target_date,
-            internal_temperature_24h_text,
-            external_temperature_24h_text,
-            internal_humidity_24h_text,
-            t_min,
-            t_max,
-            num_rooms,
-            residents,
-            has_dryer,
-            has_washing_machine,
-            has_dishwasher,
-            has_microwave,
-            building_type,
-            build_era,
-            heating_type,
-            water_heater_type,
-            years_in_house,
-            use_proxy_history,
-            min_history_hours,
-            history_consumption_text,
-            external_humidity_constant,
-        )
-
-        summary, df_show, meteo_df_show, _status, out, hum24 = _run_single_model(
-            payload=payload,
-            temps24_user=temps24_user,
-            hum24_user=hum24_user,
-            target_date=target_date,
-            save_csv=False,
-        )
-
-        preds_full = pd.DataFrame(out.get("predictions", []) or [])
-        if not preds_full.empty:
-            preds_full["timestamp"] = pd.to_datetime(preds_full["timestamp"])
-            preds_full = preds_full.sort_values("timestamp").reset_index(drop=True)
-
-        temps24 = out.get("external_temperature_24h")
-        if temps24 is None:
-            temps24 = temps24_user
+        out = _post_predict(payload)
+        preds_full = _predictions_to_df(out)
+        temps24 = out.get("external_temperature_24h") or temps24_user
+        hum24 = out.get("external_humidity_24h") or hum24_user
+        meteo_df_full = _meteo24_to_df(temps24, hum24)
 
         if behavior_enabled:
-            preds_full = _apply_behavior_adjustment_single_df(
-                preds_full,
-                behavior_hours,
-                behavior_factor_norm,
-                value_col="pred_consumption_Wh",
-            )
+            preds_full = _apply_behavior_adjustment_single_df(preds_full, behavior_hours, behavior_factor_norm)
 
-        remaining_kwh_today, cutoff_iso = _compute_remaining_kwh_today(
-            preds_full[["timestamp", "pred_consumption_Wh"]],
-            target_date,
-        )
-
+        remaining_kwh_today, cutoff_iso = _compute_remaining_kwh_today(preds_full[["timestamp", "pred_consumption_Wh"]], target_date)
         df_show = preds_full.copy()
-        meteo_df_show = _meteo24_to_df(temps24, hum24)
+        meteo_df_show = meteo_df_full.copy()
         df_show, meteo_df_show = _filter_today_for_display(df_show, meteo_df_show, target_date)
 
         out_for_summary = dict(out)
         out_for_summary["total_kWh_day"] = float(preds_full["pred_consumption_Wh"].sum() / 1000.0)
-
-        behavior_text = _behavior_summary_suffix(
-            behavior_enabled,
-            behavior_hours,
-            behavior_factor_norm,
-        )
-
-        summary = _build_summary_single(
-            out_for_summary,
-            remaining_kwh_today=remaining_kwh_today,
-            cutoff_iso=cutoff_iso,
-            behavior_text=behavior_text,
-        )
-
+        behavior_text = _behavior_summary_suffix(behavior_enabled, behavior_hours, behavior_factor_norm)
+        summary = _build_summary_single(out_for_summary, remaining_kwh_today, cutoff_iso, behavior_text)
         fig = _build_single_chart(df_show[["timestamp", "pred_consumption_Wh"]])
 
         status = "✅ Done"
         if save_csv and not preds_full.empty:
-            fp = _save_csv_full_day(
-                out=out_for_summary,
-                preds_full=preds_full,
-                temps24=temps24,
-                hum24=hum24,
-                remaining_kwh_today=remaining_kwh_today,
-                cutoff_iso=cutoff_iso,
-            )
+            fp = _save_csv_full_day(out_for_summary, preds_full, temps24, hum24, remaining_kwh_today, cutoff_iso)
             status = f"✅ Saved CSV (24h): {fp}"
 
-        return (
-            summary,
-            df_show,
-            meteo_df_show,
-            pd.DataFrame(),
-            fig,
-            status,
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
+        return summary, df_show, meteo_df_show, pd.DataFrame(), fig, status, gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
     except ValueError as e:
-        return (
-            str(e),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "⚠️ Fix inputs and try again.",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
-
+        return str(e), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "⚠️ Fix inputs and try again.", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
     except RuntimeError as e:
         msg = str(e)
-
         if msg.startswith("WEATHER_FALLBACK::"):
             detail = msg.split("WEATHER_FALLBACK::", 1)[1]
             return (
-                "⚠️ Δεν βρέθηκαν αυτόματα δεδομένα εξωτερικής θερμοκρασίας για αυτή την ημερομηνία.\n"
+                "⚠️ Δεν βρέθηκαν αυτόματα δεδομένα εξωτερικής θερμοκρασίας.\n"
                 "Συμπλήρωσε t_min και t_max ή δώσε 24 ωριαίες τιμές και ξαναπάτα Predict.",
-                pd.DataFrame(),
-                pd.DataFrame(),
-                pd.DataFrame(),
-                None,
+                pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None,
                 f"API 422: {detail}",
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
+                gr.update(visible=True, value=None), gr.update(visible=True, value=None),
             )
-
-        return (
-            msg,
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "❌ API error",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
-
+        return msg, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "❌ API error", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
     except Exception as e:
-        return (
-            f"Σφάλμα επικοινωνίας με API: {e}",
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "❌ API not reachable",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
+        return f"Σφάλμα επικοινωνίας με API: {e}", pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "❌ API not reachable", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
+
+
+def _build_common_payload_for_multi(*args, **kwargs):
+    return _prepare_payload(*args, **kwargs)
 
 
 def do_compare(
     use_history: bool,
     model_choice: str,
+    optimization: str,
     city: str,
     target_date: str,
     internal_temperature_24h_text: str,
     external_temperature_24h_text: str,
     internal_humidity_24h_text: str,
+    external_humidity_24h_text: str,
     t_min: Optional[float],
     t_max: Optional[float],
     num_rooms: float,
     residents: float,
+    num_adults: Optional[float],
+    num_children: Optional[float],
+    num_elderly: Optional[float],
+    has_ac: float,
+    has_fridge_freezer: float,
     has_dryer: float,
     has_washing_machine: float,
     has_dishwasher: float,
     has_microwave: float,
+    has_electric_oven: float,
+    has_electric_hob: float,
+    solar_panels: float,
     building_type: str,
     build_era: str,
+    income_band: str,
     heating_type: str,
     water_heater_type: str,
+    homeowner_status: str,
     years_in_house: str,
-    use_proxy_history: bool,
+    occupation: str,
+    history_csv_file: Any,
+    history_csv_path_text: str,
+    use_default_history_store: bool,
     min_history_hours: int,
     history_consumption_text: str,
-    external_humidity_constant: Optional[float],
+    apply_history_correction: bool,
+    history_correction_days: int,
+    history_correction_max_alpha: float,
+    use_recommended_history_alpha: bool,
+    recommended_history_correction_max_alpha: Optional[float],
     enable_behavior_adjustment: bool,
     high_consumption_hours_text: str,
     behavior_factor: Optional[float],
@@ -1394,288 +1531,165 @@ def do_compare(
     save_csv: bool,
 ):
     try:
-        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(
-            enable_behavior_adjustment,
-            high_consumption_hours_text,
-            behavior_factor,
-        )
+        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(enable_behavior_adjustment, high_consumption_hours_text, behavior_factor)
+        mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
+        compare_ids = _comparison_model_ids(mode)
+        effective_alpha = _resolve_effective_history_alpha(use_history, use_recommended_history_alpha, recommended_history_correction_max_alpha, history_correction_max_alpha)
 
-        need_full_weather_fallback = _check_needed_fallback_inputs(
-            city=city,
-            target_date=target_date,
-            external_temperature_24h_text=external_temperature_24h_text,
-        )
-
-        if need_full_weather_fallback:
-            missing = []
-            tmin_ok = t_min is not None
-            tmax_ok = t_max is not None
-            hum_ok = external_humidity_constant is not None
-
-            if not (tmin_ok and tmax_ok):
-                missing.append("t_min και t_max")
-            if not hum_ok:
-                missing.append("external humidity (%)")
-
-            if missing:
-                return (
-                    "⚠️ Δεν βρέθηκαν πλήρη εξωτερικά μετεωρολογικά δεδομένα από το Open-Meteo.\n"
-                    "Για τη συγκεκριμένη ημερομηνία πρέπει να συμπληρώσεις ΟΛΑ τα fallback πεδία:\n"
-                    "- t_min\n"
-                    "- t_max\n"
-                    "- external mean humidity (%)",
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    None,
-                    f"Λείπουν: {', '.join(missing)}",
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                )
-
-        payload, temps24_user, hum24_user, _hum_source_ui = _prepare_payload(
-            use_history,
-            "xgb — XGBoost (PLEGMA)",
-            city,
-            target_date,
-            internal_temperature_24h_text,
-            external_temperature_24h_text,
-            internal_humidity_24h_text,
-            t_min,
-            t_max,
-            num_rooms,
-            residents,
-            has_dryer,
-            has_washing_machine,
-            has_dishwasher,
-            has_microwave,
-            building_type,
-            build_era,
-            heating_type,
-            water_heater_type,
-            years_in_house,
-            use_proxy_history,
-            min_history_hours,
-            history_consumption_text,
-            external_humidity_constant,
+        payload, temps24_user, hum24_user = _prepare_payload(
+            use_history, "auto — Auto default", optimization, city, target_date,
+            internal_temperature_24h_text, external_temperature_24h_text,
+            internal_humidity_24h_text, external_humidity_24h_text,
+            t_min, t_max, num_rooms, residents, num_adults, num_children, num_elderly,
+            has_ac, has_fridge_freezer, has_dryer, has_washing_machine, has_dishwasher,
+            has_microwave, has_electric_oven, has_electric_hob, solar_panels,
+            building_type, build_era, income_band, heating_type, water_heater_type,
+            homeowner_status, years_in_house, occupation, history_csv_file, history_csv_path_text,
+            use_default_history_store, min_history_hours, history_consumption_text,
+            apply_history_correction, history_correction_days, effective_alpha,
         )
 
         results: Dict[str, Dict[str, Any]] = {}
         meteo_df_show = pd.DataFrame()
         primary_df_show = pd.DataFrame()
 
-        for mid in ["rf", "xgb", "lgbm"]:
+        for key, model_id in compare_ids.items():
             payload_mid = dict(payload)
-            payload_mid["model_id"] = mid
+            payload_mid["model_id"] = model_id
+            out_mid = _post_predict(payload_mid)
+            results[key] = out_mid
 
-            r = requests.post(f"{API_BASE}/predict", json=payload_mid, timeout=TIMEOUT)
-
-            if r.status_code != 200:
-                detail = ""
-                try:
-                    js = r.json()
-                    detail = js.get("detail", "") if isinstance(js, dict) else str(js)
-                except Exception:
-                    detail = r.text
-
-                if r.status_code == 422 and _needs_weather_fallback(detail):
-                    raise RuntimeError(f"WEATHER_FALLBACK::{detail}")
-
-                raise RuntimeError(f"API error ({r.status_code}) for model '{mid}': {detail}")
-
-            out_mid = r.json()
-            results[mid] = out_mid
-
-            if mid == "xgb":
-                preds_xgb = pd.DataFrame(out_mid.get("predictions", []) or [])
-                if not preds_xgb.empty:
-                    preds_xgb["timestamp"] = pd.to_datetime(preds_xgb["timestamp"])
-                    preds_xgb = preds_xgb.sort_values("timestamp").reset_index(drop=True)
-
+            if key == "lgbm":
+                preds_primary = _predictions_to_df(out_mid)
                 if behavior_enabled:
-                    preds_xgb = _apply_behavior_adjustment_single_df(
-                        preds_xgb,
-                        behavior_hours,
-                        behavior_factor_norm,
-                        value_col="pred_consumption_Wh",
-                    )
-
-                primary_df_show = preds_xgb.copy()
-
-                temps24 = out_mid.get("external_temperature_24h")
-                if temps24 is None:
-                    temps24 = temps24_user
-
-                hum24 = out_mid.get("external_humidity_24h")
-                if hum24 is None:
-                    hum24 = hum24_user
-
+                    preds_primary = _apply_behavior_adjustment_single_df(preds_primary, behavior_hours, behavior_factor_norm)
+                primary_df_show = preds_primary.copy()
+                temps24 = out_mid.get("external_temperature_24h") or temps24_user
+                hum24 = out_mid.get("external_humidity_24h") or hum24_user
                 meteo_df_full = _meteo24_to_df(temps24, hum24)
-                primary_df_show, meteo_df_show = _filter_today_for_display(
-                    primary_df_show, meteo_df_full.copy(), target_date
-                )
+                primary_df_show, meteo_df_show = _filter_today_for_display(primary_df_show, meteo_df_full.copy(), target_date)
 
         comparison_rows = []
         curve_df = None
+        curve_df_for_save = None
         remaining_map: Dict[str, Optional[float]] = {}
         cutoff_map: Dict[str, Optional[str]] = {}
 
-        for mid, out_mid in results.items():
-            preds_mid = pd.DataFrame(out_mid.get("predictions", []) or [])
-            if not preds_mid.empty:
-                preds_mid["timestamp"] = pd.to_datetime(preds_mid["timestamp"])
-                preds_mid = preds_mid.sort_values("timestamp").reset_index(drop=True)
-
+        for key, out_mid in results.items():
+            preds_mid = _predictions_to_df(out_mid)
             if behavior_enabled:
-                preds_mid = _apply_behavior_adjustment_single_df(
-                    preds_mid,
-                    behavior_hours,
-                    behavior_factor_norm,
-                    value_col="pred_consumption_Wh",
-                )
+                preds_mid = _apply_behavior_adjustment_single_df(preds_mid, behavior_hours, behavior_factor_norm)
 
-            rem_mid, cutoff_mid = _compute_remaining_kwh_today(
-                preds_mid[["timestamp", "pred_consumption_Wh"]],
-                target_date,
-            )
-            remaining_map[mid] = rem_mid
-            cutoff_map[mid] = cutoff_mid
+            rem_mid, cutoff_mid = _compute_remaining_kwh_today(preds_mid[["timestamp", "pred_consumption_Wh"]], target_date)
+            remaining_map[key] = rem_mid
+            cutoff_map[key] = cutoff_mid
+            total_kwh = float(preds_mid["pred_consumption_Wh"].sum() / 1000.0)
 
-            comparison_rows.append(
-                {
-                    "model": mid,
-                    "model_name": out_mid.get("model_name") or out_mid.get("label"),
-                    "mode": out_mid.get("mode"),
-                    "total_kWh_day": float(preds_mid["pred_consumption_Wh"].sum() / 1000.0),
-                    "remaining_kWh_today": rem_mid,
-                }
-            )
+            comparison_rows.append({
+                "model_key": key,
+                "model_id": out_mid.get("model_id"),
+                "model_name": out_mid.get("model_name"),
+                "mode": out_mid.get("mode"),
+                "optimization": out_mid.get("optimization"),
+                "prediction_variant": out_mid.get("prediction_variant"),
+                "total_kWh_day": total_kwh,
+                "remaining_kWh_today": rem_mid,
+                "history_correction_applied": out_mid.get("history_correction_applied"),
+                "history_correction_reason": out_mid.get("history_correction_reason"),
+                "history_csv_path": out_mid.get("history_csv_path"),
+            })
 
             if not preds_mid.empty:
                 temp_curve = preds_mid[["timestamp", "pred_consumption_Wh"]].copy()
-                temp_curve.rename(columns={"pred_consumption_Wh": f"{mid}_Wh"}, inplace=True)
-
-                if curve_df is None:
-                    curve_df = temp_curve
-                else:
-                    curve_df = curve_df.merge(temp_curve, on="timestamp", how="outer")
+                temp_curve.rename(columns={"pred_consumption_Wh": f"{key}_Wh"}, inplace=True)
+                curve_df = temp_curve if curve_df is None else curve_df.merge(temp_curve, on="timestamp", how="outer")
 
         comparison_df = pd.DataFrame(comparison_rows)
-        comparison_fig = None
+        flags = next(iter(results.values())).get("derived_flags", {}) or {}
+        if not comparison_df.empty:
+            comparison_df = _add_flag_columns_to_df(comparison_df, flags)
 
+        comparison_fig = None
         if curve_df is not None and not curve_df.empty:
             curve_df = curve_df.sort_values("timestamp").reset_index(drop=True)
+            curve_df_for_save = curve_df.copy()
             curve_df = _filter_today_curve_only(curve_df, target_date)
             comparison_fig = _build_compare_chart(curve_df)
 
-        behavior_text = _behavior_summary_suffix(
-            behavior_enabled,
-            behavior_hours,
-            behavior_factor_norm,
-        )
+        behavior_text = _behavior_summary_suffix(behavior_enabled, behavior_hours, behavior_factor_norm)
+        summary = _build_summary_compare(results, remaining_map, cutoff_map, behavior_text)
 
-        summary = _build_summary_compare(
-            results,
-            remaining_map,
-            cutoff_map,
-            behavior_text=behavior_text,
-        )
+        status = "✅ Comparison done"
+        if save_csv and curve_df_for_save is not None and not curve_df_for_save.empty:
+            first = next(iter(results.values()))
+            temps24_for_save = first.get("external_temperature_24h") or temps24_user
+            hum24_for_save = first.get("external_humidity_24h") or hum24_user
+            fp = _save_csv_compare(city, target_date, mode, optimization, curve_df_for_save, comparison_df, temps24_for_save, hum24_for_save, flags)
+            status = f"✅ Saved compare CSV: {fp}"
 
-        return (
-            summary,
-            primary_df_show,
-            meteo_df_show,
-            comparison_df,
-            comparison_fig,
-            "✅ Comparison done",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
+        return summary, primary_df_show, meteo_df_show, comparison_df, comparison_fig, status, gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
     except ValueError as e:
-        return (
-            str(e),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "⚠️ Fix inputs and try again.",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
-
+        return str(e), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "⚠️ Fix inputs and try again.", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
     except RuntimeError as e:
         msg = str(e)
-
         if msg.startswith("WEATHER_FALLBACK::"):
             detail = msg.split("WEATHER_FALLBACK::", 1)[1]
             return (
-                "⚠️ Δεν βρέθηκαν αυτόματα δεδομένα εξωτερικής θερμοκρασίας για αυτή την ημερομηνία.\n"
-                "Συμπλήρωσε t_min και t_max ή δώσε 24 ωριαίες τιμές και ξαναπάτα Compare.",
-                pd.DataFrame(),
-                pd.DataFrame(),
-                pd.DataFrame(),
-                None,
+                "⚠️ Δεν βρέθηκαν αυτόματα δεδομένα εξωτερικής θερμοκρασίας.\nΣυμπλήρωσε t_min και t_max ή δώσε 24 ωριαίες τιμές και ξαναπάτα Compare.",
+                pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None,
                 f"API 422: {detail}",
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
+                gr.update(visible=True, value=None), gr.update(visible=True, value=None),
             )
-
-        return (
-            msg,
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "❌ API error",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
-
+        return msg, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "❌ API error", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
     except Exception as e:
-        return (
-            f"Σφάλμα επικοινωνίας με API: {e}",
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "❌ API not reachable",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
+        return f"Σφάλμα επικοινωνίας με API: {e}", pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "❌ API not reachable", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
 
 def do_combined(
     use_history: bool,
     model_choice: str,
+    optimization: str,
     city: str,
     target_date: str,
     internal_temperature_24h_text: str,
     external_temperature_24h_text: str,
     internal_humidity_24h_text: str,
+    external_humidity_24h_text: str,
     t_min: Optional[float],
     t_max: Optional[float],
     num_rooms: float,
     residents: float,
+    num_adults: Optional[float],
+    num_children: Optional[float],
+    num_elderly: Optional[float],
+    has_ac: float,
+    has_fridge_freezer: float,
     has_dryer: float,
     has_washing_machine: float,
     has_dishwasher: float,
     has_microwave: float,
+    has_electric_oven: float,
+    has_electric_hob: float,
+    solar_panels: float,
     building_type: str,
     build_era: str,
+    income_band: str,
     heating_type: str,
     water_heater_type: str,
+    homeowner_status: str,
     years_in_house: str,
-    use_proxy_history: bool,
+    occupation: str,
+    history_csv_file: Any,
+    history_csv_path_text: str,
+    use_default_history_store: bool,
     min_history_hours: int,
     history_consumption_text: str,
-    external_humidity_constant: Optional[float],
+    apply_history_correction: bool,
+    history_correction_days: int,
+    history_correction_max_alpha: float,
+    use_recommended_history_alpha: bool,
+    recommended_history_correction_max_alpha: Optional[float],
     enable_behavior_adjustment: bool,
     high_consumption_hours_text: str,
     behavior_factor: Optional[float],
@@ -1686,78 +1700,23 @@ def do_combined(
     save_csv: bool,
 ):
     try:
-        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(
-            enable_behavior_adjustment,
-            high_consumption_hours_text,
-            behavior_factor,
-        )
+        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(enable_behavior_adjustment, high_consumption_hours_text, behavior_factor)
+        weights = _resolve_ensemble_weights(use_custom_weights, rf_weight_pct, xgb_weight_pct, lgbm_weight_pct)
+        mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
+        compare_ids = _comparison_model_ids(mode)
+        effective_alpha = _resolve_effective_history_alpha(use_history, use_recommended_history_alpha, recommended_history_correction_max_alpha, history_correction_max_alpha)
 
-        weights = _resolve_ensemble_weights(
-            use_custom_weights,
-            rf_weight_pct,
-            xgb_weight_pct,
-            lgbm_weight_pct,
-        )
-
-        need_full_weather_fallback = _check_needed_fallback_inputs(
-            city=city,
-            target_date=target_date,
-            external_temperature_24h_text=external_temperature_24h_text,
-        )
-
-        if need_full_weather_fallback:
-            missing = []
-            tmin_ok = t_min is not None
-            tmax_ok = t_max is not None
-            hum_ok = external_humidity_constant is not None
-
-            if not (tmin_ok and tmax_ok):
-                missing.append("t_min και t_max")
-            if not hum_ok:
-                missing.append("external humidity (%)")
-
-            if missing:
-                return (
-                    "⚠️ Δεν βρέθηκαν πλήρη εξωτερικά μετεωρολογικά δεδομένα από το Open-Meteo.\n"
-                    "Για τη συγκεκριμένη ημερομηνία πρέπει να συμπληρώσεις ΟΛΑ τα fallback πεδία:\n"
-                    "- t_min\n"
-                    "- t_max\n"
-                    "- external mean humidity (%)",
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    pd.DataFrame(),
-                    None,
-                    f"Λείπουν: {', '.join(missing)}",
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                )
-
-        payload, temps24_user, hum24_user, _hum_source_ui = _prepare_payload(
-            use_history,
-            "xgb — XGBoost (PLEGMA)",
-            city,
-            target_date,
-            internal_temperature_24h_text,
-            external_temperature_24h_text,
-            internal_humidity_24h_text,
-            t_min,
-            t_max,
-            num_rooms,
-            residents,
-            has_dryer,
-            has_washing_machine,
-            has_dishwasher,
-            has_microwave,
-            building_type,
-            build_era,
-            heating_type,
-            water_heater_type,
-            years_in_house,
-            use_proxy_history,
-            min_history_hours,
-            history_consumption_text,
-            external_humidity_constant,
+        payload, temps24_user, hum24_user = _prepare_payload(
+            use_history, "auto — Auto default", optimization, city, target_date,
+            internal_temperature_24h_text, external_temperature_24h_text,
+            internal_humidity_24h_text, external_humidity_24h_text,
+            t_min, t_max, num_rooms, residents, num_adults, num_children, num_elderly,
+            has_ac, has_fridge_freezer, has_dryer, has_washing_machine, has_dishwasher,
+            has_microwave, has_electric_oven, has_electric_hob, solar_panels,
+            building_type, build_era, income_band, heating_type, water_heater_type,
+            homeowner_status, years_in_house, occupation, history_csv_file, history_csv_path_text,
+            use_default_history_store, min_history_hours, history_consumption_text,
+            apply_history_correction, history_correction_days, effective_alpha,
         )
 
         results: Dict[str, Dict[str, Any]] = {}
@@ -1765,244 +1724,87 @@ def do_combined(
         curve_df = None
         temps24_for_save = None
         hum24_for_save = None
-        combined_day_info: Dict[str, Any] = {}
 
-        for mid in ["rf", "xgb", "lgbm"]:
+        for key, model_id in compare_ids.items():
             payload_mid = dict(payload)
-            payload_mid["model_id"] = mid
-
-            r = requests.post(f"{API_BASE}/predict", json=payload_mid, timeout=TIMEOUT)
-
-            if r.status_code != 200:
-                detail = ""
-                try:
-                    js = r.json()
-                    detail = js.get("detail", "") if isinstance(js, dict) else str(js)
-                except Exception:
-                    detail = r.text
-
-                if r.status_code == 422 and _needs_weather_fallback(detail):
-                    raise RuntimeError(f"WEATHER_FALLBACK::{detail}")
-
-                raise RuntimeError(f"API error ({r.status_code}) for model '{mid}': {detail}")
-
-            out_mid = r.json()
-            results[mid] = out_mid
-
-            if not combined_day_info:
-                combined_day_info = {
-                    "day_of_week": out_mid.get("day_of_week"),
-                    "season": out_mid.get("season"),
-                    "is_weekend": out_mid.get("is_weekend"),
-                    "is_holiday": out_mid.get("is_holiday"),
-                }
-
-            preds_mid = pd.DataFrame(out_mid.get("predictions", []) or [])
-            if not preds_mid.empty:
-                preds_mid["timestamp"] = pd.to_datetime(preds_mid["timestamp"])
-                preds_mid = preds_mid.sort_values("timestamp").reset_index(drop=True)
+            payload_mid["model_id"] = model_id
+            out_mid = _post_predict(payload_mid)
+            results[key] = out_mid
+            preds_mid = _predictions_to_df(out_mid)
 
             if temps24_for_save is None:
-                temps24_for_save = out_mid.get("external_temperature_24h")
-                if temps24_for_save is None:
-                    temps24_for_save = temps24_user
-
-                hum24_for_save = out_mid.get("external_humidity_24h")
-                if hum24_for_save is None:
-                    hum24_for_save = hum24_user
-
+                temps24_for_save = out_mid.get("external_temperature_24h") or temps24_user
+                hum24_for_save = out_mid.get("external_humidity_24h") or hum24_user
                 meteo_df_show = _meteo24_to_df(temps24_for_save, hum24_for_save)
 
             if not preds_mid.empty:
                 temp_curve = preds_mid[["timestamp", "pred_consumption_Wh"]].copy()
-                temp_curve.rename(columns={"pred_consumption_Wh": f"{mid}_Wh"}, inplace=True)
-
-                if curve_df is None:
-                    curve_df = temp_curve
-                else:
-                    curve_df = curve_df.merge(temp_curve, on="timestamp", how="outer")
+                temp_curve.rename(columns={"pred_consumption_Wh": f"{key}_Wh"}, inplace=True)
+                curve_df = temp_curve if curve_df is None else curve_df.merge(temp_curve, on="timestamp", how="outer")
 
         if curve_df is None or curve_df.empty:
             raise RuntimeError("No predictions available for combined forecast.")
 
         curve_df = curve_df.sort_values("timestamp").reset_index(drop=True)
-
-        curve_df["ensemble_Wh"] = (
-            weights["rf"] * curve_df["rf_Wh"]
-            + weights["xgb"] * curve_df["xgb_Wh"]
-            + weights["lgbm"] * curve_df["lgbm_Wh"]
-        )
+        curve_df["ensemble_Wh"] = weights["rf"] * curve_df["rf_Wh"] + weights["xgb"] * curve_df["xgb_Wh"] + weights["lgbm"] * curve_df["lgbm_Wh"]
 
         if behavior_enabled:
-            curve_df = _apply_behavior_adjustment_curve_df(
-                curve_df,
-                behavior_hours,
-                behavior_factor_norm,
-                target_cols=["rf_Wh", "xgb_Wh", "lgbm_Wh", "ensemble_Wh"],
-            )
+            curve_df = _apply_behavior_adjustment_curve_df(curve_df, behavior_hours, behavior_factor_norm, ["rf_Wh", "xgb_Wh", "lgbm_Wh", "ensemble_Wh"])
 
         total_kwh_day = float(curve_df["ensemble_Wh"].sum() / 1000.0)
-
-        display_curve = curve_df[["timestamp", "ensemble_Wh"]].copy()
-        display_curve.rename(columns={"ensemble_Wh": "pred_consumption_Wh"}, inplace=True)
-
-        remaining_kwh_today, cutoff_iso = _compute_remaining_kwh_today_for_col(
-            display_curve,
-            target_date,
-            "pred_consumption_Wh",
-        )
-
+        display_curve = curve_df[["timestamp", "ensemble_Wh"]].copy().rename(columns={"ensemble_Wh": "pred_consumption_Wh"})
+        remaining_kwh_today, cutoff_iso = _compute_remaining_kwh_today_for_col(display_curve, target_date, "pred_consumption_Wh")
         display_curve, meteo_df_show = _filter_today_for_display(display_curve, meteo_df_show, target_date)
 
-        behavior_text = _behavior_summary_suffix(
-            behavior_enabled,
-            behavior_hours,
-            behavior_factor_norm,
-        )
+        first = next(iter(results.values()))
+        flags = first.get("derived_flags", {}) or {}
+        behavior_text = _behavior_summary_suffix(behavior_enabled, behavior_hours, behavior_factor_norm)
+        summary = _build_summary_combined(total_kwh_day, remaining_kwh_today, cutoff_iso, city, target_date, mode, optimization, weights, flags, behavior_text)
 
-        summary = _build_summary_combined(
-            total_kwh_day=total_kwh_day,
-            remaining_kwh_today=remaining_kwh_today,
-            cutoff_iso=cutoff_iso,
-            city=city,
-            target_date=target_date,
-            mode=("withhistory" if use_history else "coldstart"),
-            weights=weights,
-            day_name=_day_name_from_index(combined_day_info.get("day_of_week")),
-            season=str(combined_day_info.get("season", "Unknown")),
-            is_weekend=_yes_no_flag(combined_day_info.get("is_weekend")),
-            is_holiday=_yes_no_flag(combined_day_info.get("is_holiday")),
-            behavior_text=behavior_text,
-        )
+        comparison_df = pd.DataFrame([
+            {"model_key": "rf", "weight": weights["rf"], "total_kWh_day": float(curve_df["rf_Wh"].sum() / 1000.0)},
+            {"model_key": "xgb", "weight": weights["xgb"], "total_kWh_day": float(curve_df["xgb_Wh"].sum() / 1000.0)},
+            {"model_key": "lgbm", "weight": weights["lgbm"], "total_kWh_day": float(curve_df["lgbm_Wh"].sum() / 1000.0)},
+            {"model_key": "combined", "weight": 1.0, "total_kWh_day": total_kwh_day},
+        ])
+        comparison_df = _add_flag_columns_to_df(comparison_df, flags)
 
-        comparison_df = pd.DataFrame(
-            [
-                {
-                    "model": "rf",
-                    "weight": weights["rf"],
-                    "total_kWh_day": float(curve_df["rf_Wh"].sum() / 1000.0),
-                },
-                {
-                    "model": "xgb",
-                    "weight": weights["xgb"],
-                    "total_kWh_day": float(curve_df["xgb_Wh"].sum() / 1000.0),
-                },
-                {
-                    "model": "lgbm",
-                    "weight": weights["lgbm"],
-                    "total_kWh_day": float(curve_df["lgbm_Wh"].sum() / 1000.0),
-                },
-                {
-                    "model": "combined",
-                    "weight": 1.0,
-                    "total_kWh_day": total_kwh_day,
-                },
-            ]
-        )
-
-        fig_curve = curve_df.copy()
-        fig_curve = _filter_today_curve_only(fig_curve, target_date)
+        fig_curve = _filter_today_curve_only(curve_df, target_date)
         fig = _build_compare_chart(fig_curve[["timestamp", "rf_Wh", "xgb_Wh", "lgbm_Wh", "ensemble_Wh"]])
 
         status = "✅ Combined prediction done"
-
         if save_csv:
-            fp = _save_csv_combined(
-                city=city,
-                target_date=target_date,
-                mode=("withhistory" if use_history else "coldstart"),
-                curve_df=curve_df,
-                temps24=temps24_for_save,
-                hum24=hum24_for_save,
-                remaining_kwh_today=remaining_kwh_today,
-                cutoff_iso=cutoff_iso,
-                weights=weights,
-                day_of_week=combined_day_info.get("day_of_week"),
-                season=combined_day_info.get("season"),
-                is_weekend=combined_day_info.get("is_weekend"),
-                is_holiday=combined_day_info.get("is_holiday"),
-            )
+            fp = _save_csv_combined(city, target_date, mode, optimization, curve_df, temps24_for_save, hum24_for_save, remaining_kwh_today, cutoff_iso, weights, flags)
             status = f"✅ Saved combined CSV: {fp}"
 
-        return (
-            summary,
-            display_curve,
-            meteo_df_show,
-            comparison_df,
-            fig,
-            status,
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
+        return summary, display_curve, meteo_df_show, comparison_df, fig, status, gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
     except ValueError as e:
-        return (
-            str(e),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "⚠️ Fix inputs and try again.",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
-
+        return str(e), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "⚠️ Fix inputs and try again.", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
     except RuntimeError as e:
         msg = str(e)
-
         if msg.startswith("WEATHER_FALLBACK::"):
             detail = msg.split("WEATHER_FALLBACK::", 1)[1]
             return (
-                "⚠️ Δεν βρέθηκαν αυτόματα δεδομένα εξωτερικής θερμοκρασίας για αυτή την ημερομηνία.\n"
-                "Συμπλήρωσε t_min και t_max ή δώσε 24 ωριαίες τιμές και ξαναπάτα Combined Prediction.",
-                pd.DataFrame(),
-                pd.DataFrame(),
-                pd.DataFrame(),
-                None,
+                "⚠️ Δεν βρέθηκαν αυτόματα δεδομένα εξωτερικής θερμοκρασίας.\nΣυμπλήρωσε t_min και t_max ή δώσε 24 ωριαίες τιμές και ξαναπάτα Combined Prediction.",
+                pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None,
                 f"API 422: {detail}",
-                gr.update(visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
+                gr.update(visible=True, value=None), gr.update(visible=True, value=None),
             )
-
-        return (
-            msg,
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "❌ API error",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
-
+        return msg, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "❌ API error", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
     except Exception as e:
-        return (
-            f"Σφάλμα επικοινωνίας με API: {e}",
-            pd.DataFrame(),
-            pd.DataFrame(),
-            pd.DataFrame(),
-            None,
-            "❌ API not reachable",
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-            gr.update(visible=False, value=None),
-        )
+        return f"Σφάλμα επικοινωνίας με API: {e}", pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, "❌ API not reachable", gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
 
-MODELS = _fetch_models()
-MODEL_CHOICES = [_format_model_choice(m) for m in MODELS]
-DEFAULT_MODEL = next(
-    (choice for choice in MODEL_CHOICES if choice.startswith("xgb")),
-    MODEL_CHOICES[0] if MODEL_CHOICES else "xgb — XGBoost (PLEGMA)"
-)
-
+# ============================================================
+# UI EVENTS
+# ============================================================
 
 def _on_use_history_toggle(use_history: bool):
-    return gr.update(visible=use_history)
+    mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
+    choices = _model_choices_for_mode(mode)
+    value = choices[0] if choices else "auto — Auto default"
+    return gr.update(visible=use_history), gr.update(choices=choices, value=value)
 
 
 def _toggle_custom_weights(use_custom: bool):
@@ -2010,12 +1812,16 @@ def _toggle_custom_weights(use_custom: bool):
 
 
 def _reset_fallbacks_on_change(_):
-    return (
-        gr.update(visible=False, value=None),
-        gr.update(visible=False, value=None),
-        gr.update(visible=False, value=None),
-    )
+    return gr.update(visible=False, value=None), gr.update(visible=False, value=None)
 
+
+# ============================================================
+# BUILD UI
+# ============================================================
+
+INITIAL_MODE = MODE_NO_HISTORY
+MODEL_CHOICES = _model_choices_for_mode(INITIAL_MODE)
+DEFAULT_MODEL = MODEL_CHOICES[0] if MODEL_CHOICES else "auto — Auto default"
 
 with gr.Blocks(title="PLEGMA Forecasting UI") as demo:
     gr.Markdown("## PLEGMA Load Forecasting (Demo UI)")
@@ -2030,22 +1836,16 @@ with gr.Blocks(title="PLEGMA Forecasting UI") as demo:
         use_history = gr.Checkbox(
             value=False,
             label="Πρόβλεψη με χρήση ιστορικών δεδομένων",
-            info="Αν το ενεργοποιήσεις, το API θα χρησιμοποιήσει mode='withhistory'.",
+            info="Αν το ενεργοποιήσεις, το API θα χρησιμοποιήσει mode='with_history'.",
         )
 
     with gr.Row():
-        model_choice = gr.Dropdown(
-            choices=MODEL_CHOICES,
-            value=DEFAULT_MODEL,
-            label="Μοντέλο",
-        )
+        model_choice = gr.Dropdown(choices=MODEL_CHOICES, value=DEFAULT_MODEL, label="Μοντέλο")
+        optimization = gr.Dropdown(choices=["balanced", "daily"], value="balanced", label="Optimization")
 
     with gr.Row():
         city = gr.Dropdown(choices=DEFAULT_CITIES, value="athens", label="City")
-        target_date = gr.Textbox(
-            value=_today_date().isoformat(),
-            label="Target date (YYYY-MM-DD)",
-        )
+        target_date = gr.Textbox(value=_today_date().isoformat(), label="Target date (YYYY-MM-DD)")
 
     with gr.Accordion("Environmental inputs (24h)", open=True):
         internal_temperature_24h_text = gr.Textbox(
@@ -2064,173 +1864,285 @@ with gr.Blocks(title="PLEGMA Forecasting UI") as demo:
             label="internal_humidity_24h (default visible, editable)",
             lines=3,
         )
-
-        gr.Markdown(
-            "Αν το Open-Meteo δεν βρει πλήρη εξωτερικά δεδομένα, "
-            "θα εμφανιστούν μαζί τα fallback πεδία για θερμοκρασία και υγρασία."
+        external_humidity_24h_text = gr.Textbox(
+            value="",
+            label="external_humidity_24h (optional, 24 values)",
+            placeholder="Άστο κενό για Open-Meteo / default humidity profile από API",
+            lines=3,
         )
-
+        gr.Markdown("Αν δεν βρεθεί εξωτερική θερμοκρασία από Open-Meteo, συμπλήρωσε t_min και t_max.")
         with gr.Row():
             t_min = gr.Number(value=None, label="t_min (°C)", visible=False)
             t_max = gr.Number(value=None, label="t_max (°C)", visible=False)
 
-        external_humidity_constant = gr.Number(
-            value=None,
-            label="Fallback mean external humidity (%)",
-            visible=False,
-            info="Το σύστημα θα δημιουργήσει αυτόματα ένα ήπιο 24ωρο προφίλ υγρασίας από αυτή τη μέση τιμή.",
-        )
-
-    with gr.Accordion("Static / household features", open=True):
-        with gr.Row():
-            num_rooms = gr.Number(value=3, minimum=0, label="num_rooms")
-            residents = gr.Number(value=2, minimum=0, label="residents")
+    with gr.Accordion("Household inputs", open=True):
+      
+        # --------------------------------------------------------
+        # Visible household inputs
+        # --------------------------------------------------------
 
         with gr.Row():
-            has_dryer = gr.Number(value=0, minimum=0, maximum=1, label="has_dryer")
-            has_washing_machine = gr.Number(value=1, minimum=0, maximum=1, label="has_washing_machine")
-            has_dishwasher = gr.Number(value=1, minimum=0, maximum=1, label="has_dishwasher")
-            has_microwave = gr.Number(value=1, minimum=0, maximum=1, label="has_microwave")
+            building_type = gr.Dropdown(
+                choices=DEFAULT_BUILDING_TYPES,
+                value="apartment",
+                label="building_type",
+            )
+            build_era = gr.Dropdown(
+                choices=DEFAULT_BUILD_ERAS,
+                value="1970_1990",
+                label="build_era",
+            )
+            num_rooms = gr.Number(
+                value=3,
+                label="num_rooms",
+                minimum=0,
+            )
+            residents = gr.Number(
+                value=2,
+                label="residents",
+                minimum=0,
+            )
 
         with gr.Row():
-            building_type = gr.Dropdown(choices=DEFAULT_BUILDING_TYPES, value="apartment", label="building_type")
-            build_era = gr.Dropdown(choices=DEFAULT_BUILD_ERAS, value="1970_1990", label="build_era")
-            heating_type = gr.Dropdown(choices=DEFAULT_HEATING_TYPES, value="radiator_oil", label="heating_type")
+            has_dryer = gr.Dropdown(
+                choices=[0, 1],
+                value=0,
+                label="has_dryer",
+            )
+            has_ac = gr.Dropdown(
+                choices=[0, 1],
+                value=1,
+                label="has_ac",
+            )
+            has_washing_machine = gr.Dropdown(
+                choices=[0, 1],
+                value=1,
+                label="has_washing_machine",
+            )
+            has_dishwasher = gr.Dropdown(
+                choices=[0, 1],
+                value=1,
+                label="has_dishwasher",
+            )
+            has_microwave = gr.Dropdown(
+                choices=[0, 1],
+                value=1,
+                label="has_microwave",
+            )
 
         with gr.Row():
+            heating_type = gr.Dropdown(
+                choices=DEFAULT_HEATING_TYPES,
+                value="air_conditioner",
+                label="heating_type",
+            )
             water_heater_type = gr.Dropdown(
                 choices=DEFAULT_WATER_HEATER_TYPES,
                 value="electric_boiler",
-                label="water_heater_type"
+                label="water_heater_type",
             )
             years_in_house = gr.Dropdown(
                 choices=DEFAULT_YEARS_IN_HOUSE,
-                value="1_to_2_years",
-                label="years_in_house"
+                value="3_to_4_years",
+                label="years_in_house",
             )
 
+        # --------------------------------------------------------
+        # Hidden fixed / non-essential inputs
+        # --------------------------------------------------------
+        # These components must still exist because _prepare_payload,
+        # do_predict, do_compare, do_combined and common_inputs expect them.
+        # They are hidden from the user but their default values are sent to the API.
+
+        num_adults = gr.Number(
+            value=None,
+            label="num_adults",
+            visible=False,
+        )
+        num_children = gr.Number(
+            value=0,
+            label="num_children",
+            visible=False,
+        )
+        num_elderly = gr.Number(
+            value=0,
+            label="num_elderly",
+            visible=False,
+        )
+
+        # Fixed appliance assumptions for the selected PLEGMA case-study homes.
+        has_fridge_freezer = gr.Dropdown(
+            choices=[0, 1],
+            value=1,
+            label="has_fridge_freezer",
+            visible=False,
+        )
+        has_electric_oven = gr.Dropdown(
+            choices=[0, 1],
+            value=1,
+            label="has_electric_oven",
+            visible=False,
+        )
+        has_electric_hob = gr.Dropdown(
+            choices=[0, 1],
+            value=1,
+            label="has_electric_hob",
+            visible=False,
+        )
+        solar_panels = gr.Dropdown(
+            choices=[0, 1],
+            value=0,
+            label="solar_panels",
+            visible=False,
+        )
+
+        # Non-essential metadata kept hidden to preserve API compatibility.
+        income_band = gr.Dropdown(
+            choices=DEFAULT_INCOME_BANDS,
+            value="unknown",
+            label="income_band",
+            visible=False,
+        )
+        homeowner_status = gr.Dropdown(
+            choices=DEFAULT_HOMEOWNER_STATUS,
+            value="unknown",
+            label="homeowner_status",
+            visible=False,
+        )
+        occupation = gr.Dropdown(
+            choices=DEFAULT_OCCUPATION,
+            value="unknown",
+            label="occupation",
+            visible=False,
+        )
+
     with gr.Group(visible=False) as history_group:
-        gr.Markdown("### History options (μόνο για with-history mode)")
-        use_proxy_history = gr.Checkbox(
-            value=True,
-            label="Use history from CSV store",
-        )
-        min_history_hours = gr.Number(value=168, precision=0, minimum=1, label="min_history_hours")
-        history_consumption_text = gr.Textbox(
-            value="",
-            label="history_consumption_Wh (comma-separated) [optional]",
-        )
+        with gr.Accordion("With-history inputs", open=True):
+            gr.Markdown(
+                "Το history CSV πρέπει να είναι single-home αρχείο με στήλες `timestamp` και `consumption_Wh`. "
+                "Δεν χρειάζεται και δεν ζητείται `home_id`."
+            )
+            with gr.Row():
+                history_csv_file = gr.UploadButton(
+                    "Select history CSV",
+                    file_types=[".csv"],
+                    file_count="single",
+                )
+                history_csv_path_text = gr.Textbox(
+                    value="",
+                    label="Selected history CSV path",
+                    placeholder="Θα συμπληρωθεί αυτόματα μετά την επιλογή αρχείου ή γράψε path χειροκίνητα",
+                    scale=4,
+                )
+            history_upload_status = gr.Markdown("No history CSV selected.")
+
+            use_default_history_store = gr.Checkbox(
+                value=True,
+                label="Use default history_store.csv if no CSV/manual history is provided",
+            )
+            min_history_hours = gr.Number(value=168, label="min_history_hours", precision=0, minimum=1)
+            history_consumption_text = gr.Textbox(
+                value="",
+                label="history_consumption_Wh manual vector (optional, comma-separated)",
+                placeholder="π.χ. 100, 120, 95, ...",
+                lines=4,
+            )
+
+            with gr.Row():
+                apply_history_correction = gr.Checkbox(value=True, label="Apply adaptive history correction")
+                history_correction_days = gr.Number(value=7, label="history_correction_days", precision=0, minimum=1, maximum=30)
+                history_correction_max_alpha = gr.Number(value=0.20, label="manual max_alpha", minimum=0.0, maximum=1.0)
+
+            with gr.Accordion("History stability recommendation", open=False):
+                analyze_history_btn = gr.Button("Analyze history stability")
+                with gr.Row():
+                    history_stability_score = gr.Textbox(value="", label="Stability score", interactive=False)
+                    history_stability_category = gr.Textbox(value="Outdated / not analyzed", label="Category", interactive=False)
+                    recommended_history_correction_max_alpha = gr.Number(value=None, label="Recommended max_alpha", interactive=False)
+                history_stability_explanation = gr.Textbox(value="", label="Explanation", lines=10, interactive=False)
+                history_stability_status = gr.Markdown("History stability recommendation not analyzed yet.")
+                use_recommended_history_alpha = gr.Checkbox(value=False, label="Use recommended max_alpha in Predict/Compare/Combined")
 
     with gr.Accordion("Behavioral adjustment (optional)", open=False):
-        gr.Markdown(
-            "Προαιρετικό post-processing των προβλέψεων.\n"
-            "Δήλωσε ώρες στις οποίες αναμένεις διαφορετική κατανάλωση, π.χ. **7-9,18-23**.\n"
-            "Τιμή factor > 1 αυξάνει την κατανάλωση, ενώ τιμή factor < 1 τη μειώνει.\n"
-            "Το ML μοντέλο δεν αλλάζει· η προσαρμογή εφαρμόζεται μόνο στο UI."
-        )
-
-        enable_behavior_adjustment = gr.Checkbox(
-            value=False,
-            label="Enable behavioral adjustment",
-        )
-
+        enable_behavior_adjustment = gr.Checkbox(value=False, label="Enable behavioral adjustment")
         high_consumption_hours_text = gr.Textbox(
             value="",
-            label="Adjusted hours",
-            placeholder="π.χ. 7-9, 13-15, 18-23",
+            label="Hours to adjust",
+            placeholder="π.χ. 18-23 ή 7,8,19,20",
         )
+        behavior_factor = gr.Number(value=1.10, label="Behavior factor", minimum=0.01)
 
-        behavior_factor = gr.Number(
-            value=1.15,
-            minimum=0.01,
-            label="Behavior factor",
-            info="Παράδειγμα: 1.15 σημαίνει +15%, ενώ 0.90 σημαίνει -10% στις δηλωμένες ώρες.",
-        )
+    with gr.Accordion("Weighted ensemble settings", open=False):
+        use_custom_weights = gr.Checkbox(value=False, label="Use custom ensemble weights")
+        with gr.Group(visible=False) as custom_weights_group:
+            with gr.Row():
+                rf_weight_pct = gr.Number(value=25, label="RF weight (%)", minimum=0, maximum=100)
+                xgb_weight_pct = gr.Number(value=35, label="XGB weight (%)", minimum=0, maximum=100)
+                lgbm_weight_pct = gr.Number(value=40, label="LGBM weight (%)", minimum=0, maximum=100)
 
-    with gr.Accordion("Ensemble weights (optional)", open=False):
-        use_custom_weights = gr.Checkbox(
-            value=False,
-            label="Use custom ensemble weights",
-        )
-
-        with gr.Row(visible=False) as weights_group:
-            rf_weight_pct = gr.Number(value=30, minimum=0, maximum=100, label="RF weight (%)")
-            xgb_weight_pct = gr.Number(value=40, minimum=0, maximum=100, label="XGB weight (%)")
-            lgbm_weight_pct = gr.Number(value=30, minimum=0, maximum=100, label="LGBM weight (%)")
+    save_csv = gr.Checkbox(value=False, label="Save prediction CSV")
 
     with gr.Row():
-        save_csv = gr.Checkbox(value=False, label="Save prediction CSV")
+        predict_btn = gr.Button("Predict", variant="primary")
+        compare_btn = gr.Button("Compare RF / XGB / LGBM")
+        combined_btn = gr.Button("Combined Prediction")
 
-    with gr.Row():
-        btn_predict = gr.Button("Predict", variant="primary")
-        btn_compare = gr.Button("Compare")
-        btn_combined = gr.Button("Combined Prediction")
+    summary_box = gr.Textbox(label="Summary", lines=18)
+    status_box = gr.Textbox(label="Status", lines=2)
+    plot_out = gr.Plot(label="Prediction chart")
 
-    with gr.Row():
-        summary = gr.Textbox(label="Summary", lines=18)
-
-    with gr.Row():
-        table = gr.Dataframe(label="Predictions (hourly)", interactive=False)
-
-    with gr.Row():
-        meteo_table = gr.Dataframe(
-            label="External meteo used (hourly temperature + humidity)",
-            interactive=False,
-        )
-
-    with gr.Row():
-        comparison_table = gr.Dataframe(label="Model comparison", interactive=False)
-
-    with gr.Row():
-        comparison_plot = gr.Plot(label="Prediction / Comparison chart")
-
-    with gr.Row():
-        status = gr.Textbox(label="Status", lines=2)
-
-    use_history.change(fn=_on_use_history_toggle, inputs=[use_history], outputs=[history_group])
-
-    use_custom_weights.change(
-        fn=_toggle_custom_weights,
-        inputs=[use_custom_weights],
-        outputs=[weights_group],
-    )
-
-    target_date.change(
-        fn=_reset_fallbacks_on_change,
-        inputs=[target_date],
-        outputs=[t_min, t_max, external_humidity_constant],
-    )
-    city.change(
-        fn=_reset_fallbacks_on_change,
-        inputs=[city],
-        outputs=[t_min, t_max, external_humidity_constant],
-    )
+    with gr.Tabs():
+        with gr.Tab("Prediction / Display table"):
+            pred_table = gr.Dataframe(label="Predictions")
+        with gr.Tab("Weather table"):
+            weather_table = gr.Dataframe(label="Weather / external environmental profile")
+        with gr.Tab("Comparison table"):
+            comparison_table = gr.Dataframe(label="Comparison / ensemble totals")
 
     common_inputs = [
         use_history,
         model_choice,
+        optimization,
         city,
         target_date,
         internal_temperature_24h_text,
         external_temperature_24h_text,
         internal_humidity_24h_text,
+        external_humidity_24h_text,
         t_min,
         t_max,
         num_rooms,
         residents,
+        num_adults,
+        num_children,
+        num_elderly,
+        has_ac,
+        has_fridge_freezer,
         has_dryer,
         has_washing_machine,
         has_dishwasher,
         has_microwave,
+        has_electric_oven,
+        has_electric_hob,
+        solar_panels,
         building_type,
         build_era,
+        income_band,
         heating_type,
         water_heater_type,
+        homeowner_status,
         years_in_house,
-        use_proxy_history,
+        occupation,
+        history_csv_file,
+        history_csv_path_text,
+        use_default_history_store,
         min_history_hours,
         history_consumption_text,
-        external_humidity_constant,
+        apply_history_correction,
+        history_correction_days,
+        history_correction_max_alpha,
+        use_recommended_history_alpha,
+        recommended_history_correction_max_alpha,
         enable_behavior_adjustment,
         high_consumption_hours_text,
         behavior_factor,
@@ -2242,19 +2154,58 @@ with gr.Blocks(title="PLEGMA Forecasting UI") as demo:
     ]
 
     common_outputs = [
-        summary,
-        table,
-        meteo_table,
+        summary_box,
+        pred_table,
+        weather_table,
         comparison_table,
-        comparison_plot,
-        status,
+        plot_out,
+        status_box,
         t_min,
         t_max,
-        external_humidity_constant,
     ]
 
-    btn_predict.click(fn=do_predict, inputs=common_inputs, outputs=common_outputs)
-    btn_compare.click(fn=do_compare, inputs=common_inputs, outputs=common_outputs)
-    btn_combined.click(fn=do_combined, inputs=common_inputs, outputs=common_outputs)
+    predict_btn.click(fn=do_predict, inputs=common_inputs, outputs=common_outputs)
+    compare_btn.click(fn=do_compare, inputs=common_inputs, outputs=common_outputs)
+    combined_btn.click(fn=do_combined, inputs=common_inputs, outputs=common_outputs)
 
-demo.launch(server_name=UI_HOST, server_port=UI_PORT, share=False)
+    use_history.change(fn=_on_use_history_toggle, inputs=[use_history], outputs=[history_group, model_choice])
+    use_custom_weights.change(fn=_toggle_custom_weights, inputs=[use_custom_weights], outputs=[custom_weights_group])
+
+    history_csv_file.upload(
+        fn=register_history_csv_upload,
+        inputs=[history_csv_file],
+        outputs=[history_csv_path_text, history_upload_status],
+    )
+
+    analyze_history_btn.click(
+        fn=analyze_history_stability_recommendation,
+        inputs=[history_csv_file, history_csv_path_text, target_date, history_correction_days, min_history_hours, history_consumption_text],
+        outputs=[
+            history_stability_score,
+            history_stability_category,
+            recommended_history_correction_max_alpha,
+            history_stability_explanation,
+            history_stability_status,
+        ],
+    )
+
+    for comp in [history_csv_path_text, history_consumption_text, target_date, history_correction_days, min_history_hours]:
+        comp.change(
+            fn=_reset_history_stability_recommendation,
+            inputs=[],
+            outputs=[
+                history_stability_score,
+                history_stability_category,
+                recommended_history_correction_max_alpha,
+                history_stability_explanation,
+                history_stability_status,
+                use_recommended_history_alpha,
+            ],
+        )
+
+    for comp in [city, target_date, external_temperature_24h_text]:
+        comp.change(fn=_reset_fallbacks_on_change, inputs=[comp], outputs=[t_min, t_max])
+
+
+if __name__ == "__main__":
+    demo.launch(server_name=UI_HOST, server_port=UI_PORT, show_error=True)
