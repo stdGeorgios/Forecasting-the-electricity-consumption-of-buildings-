@@ -35,7 +35,7 @@ Forecasting-the-electricity-consumption-of-buildings-
 ├── README.md
 ├── requirements.txt
 ├── INFO.txt
-└── CODE_DOCUMENTATION.pdf / CODE_DOCUMENTATION.docx
+└── CODE_DOCUMENTATION.pdf
 ```
 
 Ο φάκελος `IDEAL` περιλαμβάνει τον βασικό κώδικα της εργασίας για το σύνολο δεδομένων IDEAL, ενώ ο φάκελος `PLEGMA` περιλαμβάνει την αντίστοιχη προσαρμογή της μεθοδολογίας στο ελληνικό σύνολο δεδομένων PLEGMA.
@@ -113,10 +113,6 @@ Forecasting-the-electricity-consumption-of-buildings-
 Η αναλυτική τεχνική περιγραφή των βασικών notebooks και Python scripts παρέχεται στο αρχείο:
 
 * `CODE_DOCUMENTATION.pdf`
-
-Παρέχεται επίσης και επεξεργάσιμη έκδοση:
-
-* `CODE_DOCUMENTATION.docx`
 
 Το αρχείο αυτό περιγράφει τον ρόλο των βασικών scripts και notebooks που χρησιμοποιήθηκαν για την προεπεξεργασία, τη δημιουργία χαρακτηριστικών, την εκπαίδευση μοντέλων, την αξιολόγηση αποτελεσμάτων και την ανάπτυξη της λογικής API/UI.
 
