@@ -10,34 +10,33 @@
 
 ## Δομή αποθετηρίου
 
-Το αποθετήριο οργανώνεται σε δύο βασικούς φακέλους, οι οποίοι αντιστοιχούν στα δύο σύνολα δεδομένων που χρησιμοποιήθηκαν στην εργασία:
+Το αποθετήριο οργανώνεται σε δύο βασικούς φακέλους, οι οποίοι αντιστοιχούν στα δύο σύνολα δεδομένων που χρησιμοποιήθηκαν στην εργασία: IDEAL και PLEGMA.
 
-```text
+Η βασική δομή του αποθετηρίου είναι η εξής:
+
 Forecasting-the-electricity-consumption-of-buildings-
 │
 ├── IDEAL/
-│   ├── preprocessing scripts
-│   ├── EDA scripts
-│   ├── baseline scripts
-│   ├── machine learning scripts
-│   ├── evaluation scripts
-│   └── API/UI scripts
+│   ├── API_UI scripts/
+│   ├── Baseline scripts/
+│   ├── EDA scripts/
+│   ├── Evaluation scripts/
+│   ├── Machine Learning scripts/
+│   ├── Preprocessing scripts/
+│   └── Feature_Importance_unified.ipynb
 │
 ├── PLEGMA/
-│   ├── preprocessing and feature engineering scripts
-│   ├── EDA scripts
-│   ├── baseline scripts
-│   ├── machine learning scripts
-│   ├── evaluation scripts
-│   └── API/UI scripts
+│   ├── API_UI scripts/
+│   ├── Evaluation scripts/
+│   ├── Machine Learning scripts/
+│   └── Prepro+feature+baseline_ scripts/
 │
-├── CODE_DOCUMENTATION.pdf
-├── CODE_DOCUMENTATION.docx
+├── README.md
 ├── requirements.txt
-└── README.md
-```
+├── INFO.txt
+└── CODE_DOCUMENTATION.pdf / CODE_DOCUMENTATION.docx
 
-Ο φάκελος `IDEAL` περιλαμβάνει τον βασικό κώδικα της εργασίας για το σύνολο δεδομένων IDEAL, ενώ ο φάκελος `PLEGMA` περιλαμβάνει την αντίστοιχη προσαρμογή της μεθοδολογίας στο ελληνικό σύνολο δεδομένων PLEGMA.
+Ο φάκελος IDEAL περιλαμβάνει τον βασικό κώδικα της εργασίας για το σύνολο δεδομένων IDEAL, ενώ ο φάκελος PLEGMA περιλαμβάνει την αντίστοιχη προσαρμογή της μεθοδολογίας στο ελληνικό σύνολο δεδομένων PLEGMA.
 
 ## Υλοποίηση για το σύνολο δεδομένων IDEAL
 
