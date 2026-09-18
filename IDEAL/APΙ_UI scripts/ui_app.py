@@ -102,14 +102,23 @@ URBAN_RURAL_OPTIONS = [
     ("3+ — Remote small town / rural", "3+"),
 ]
 
-DEFAULT_ENSEMBLE_WEIGHTS = {
-    "rf": 0.40,
-    "xgb": 0.30,
-    "lgbm": 0.30,
-}
-
 MODE_NO_HISTORY = "no_history"
 MODE_WITH_HISTORY = "with_history"
+
+# Default ensemble weights per prediction scenario.
+# Adjust these values if validation results support different combinations.
+DEFAULT_ENSEMBLE_WEIGHTS_BY_MODE = {
+    MODE_NO_HISTORY: {
+        "rf": 0.40,
+        "xgb": 0.30,
+        "lgbm": 0.30,
+    },
+    MODE_WITH_HISTORY: {
+        "rf": 0.10,
+        "xgb": 0.45,
+        "lgbm": 0.45,
+    },
+}
 
 # Legacy names kept only for internal compatibility with old model IDs / wording.
 MODE_COLDSTART = MODE_NO_HISTORY
@@ -894,13 +903,19 @@ def _behavior_summary_suffix(enabled: bool, hours: List[int], factor: float) -> 
 # ============================================================
 
 def _resolve_ensemble_weights(
+    mode: str,
     use_custom_weights: bool,
     rf_weight_pct: Optional[float],
     xgb_weight_pct: Optional[float],
     lgbm_weight_pct: Optional[float],
 ) -> Dict[str, float]:
+    """Resolve ensemble weights for the selected prediction mode."""
     if not use_custom_weights:
-        return dict(DEFAULT_ENSEMBLE_WEIGHTS)
+        default_weights = DEFAULT_ENSEMBLE_WEIGHTS_BY_MODE.get(
+            mode,
+            DEFAULT_ENSEMBLE_WEIGHTS_BY_MODE[MODE_NO_HISTORY],
+        )
+        return dict(default_weights)
 
     try:
         rf = float(rf_weight_pct if rf_weight_pct is not None else 0.0)
@@ -914,10 +929,16 @@ def _resolve_ensemble_weights(
 
     total = rf + xgb + lgbm
     if abs(total - 100.0) > 1e-6:
-        raise ValueError(f"Τα ensemble weights πρέπει να αθροίζουν σε 100%. Τρέχον άθροισμα: {total:.2f}%.")
+        raise ValueError(
+            "Τα ensemble weights πρέπει να αθροίζουν σε 100%. "
+            f"Τρέχον άθροισμα: {total:.2f}%."
+        )
 
-    return {"rf": rf / 100.0, "xgb": xgb / 100.0, "lgbm": lgbm / 100.0}
-
+    return {
+        "rf": rf / 100.0,
+        "xgb": xgb / 100.0,
+        "lgbm": lgbm / 100.0,
+    }
 
 def _weights_text(weights: Dict[str, float]) -> str:
     return f"Weights: RF={weights['rf']:.2f}, XGB={weights['xgb']:.2f}, LGBM={weights['lgbm']:.2f}"
@@ -1819,10 +1840,22 @@ def do_combined(
     save_csv: bool,
 ):
     try:
-        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(enable_behavior_adjustment, high_consumption_hours_text, behavior_factor)
-        weights = _resolve_ensemble_weights(use_custom_weights, rf_weight_pct, xgb_weight_pct, lgbm_weight_pct)
+        behavior_enabled, behavior_hours, behavior_factor_norm = _normalize_behavior_inputs(
+            enable_behavior_adjustment,
+            high_consumption_hours_text,
+            behavior_factor,
+        )
 
         mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
+
+        weights = _resolve_ensemble_weights(
+            mode=mode,
+            use_custom_weights=use_custom_weights,
+            rf_weight_pct=rf_weight_pct,
+            xgb_weight_pct=xgb_weight_pct,
+            lgbm_weight_pct=lgbm_weight_pct,
+        )
+
         compare_ids = _comparison_model_ids(mode)
 
         effective_history_correction_max_alpha = _resolve_effective_history_alpha(
@@ -1951,16 +1984,42 @@ INITIAL_MODEL_CHOICES = _model_choices_for_mode(INITIAL_MODE)
 INITIAL_DEFAULT_MODEL = INITIAL_MODEL_CHOICES[0] if INITIAL_MODEL_CHOICES else "auto — Auto default"
 
 
-def _on_use_history_toggle(use_history: bool):
+def _ensemble_status_text(mode: str, use_custom_weights: bool) -> str:
+    defaults = DEFAULT_ENSEMBLE_WEIGHTS_BY_MODE[mode]
+    scenario = "With-history" if mode == MODE_WITH_HISTORY else "No-history"
+    status = (
+        f"{scenario} default weights: "
+        f"RF={defaults['rf'] * 100:.0f}%, "
+        f"XGB={defaults['xgb'] * 100:.0f}%, "
+        f"LGBM={defaults['lgbm'] * 100:.0f}%."
+    )
+    if use_custom_weights:
+        return status + " Custom weights are enabled, so the editable values are used."
+    return status + " These defaults are used automatically by Combined Prediction."
+
+
+def _on_use_history_toggle(use_history: bool, use_custom_weights: bool):
     mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
     choices = _model_choices_for_mode(mode)
     default_choice = choices[0] if choices else "auto — Auto default"
-    return gr.update(visible=use_history), gr.update(choices=choices, value=default_choice)
+    defaults = DEFAULT_ENSEMBLE_WEIGHTS_BY_MODE[mode]
+
+    return (
+        gr.update(visible=use_history),
+        gr.update(choices=choices, value=default_choice),
+        gr.update(value=defaults["rf"] * 100.0),
+        gr.update(value=defaults["xgb"] * 100.0),
+        gr.update(value=defaults["lgbm"] * 100.0),
+        _ensemble_status_text(mode, use_custom_weights),
+    )
 
 
-def _toggle_custom_weights(use_custom: bool):
-    return gr.update(visible=use_custom)
-
+def _toggle_custom_weights(use_custom: bool, use_history: bool):
+    mode = MODE_WITH_HISTORY if use_history else MODE_NO_HISTORY
+    return (
+        gr.update(visible=use_custom),
+        _ensemble_status_text(mode, use_custom),
+    )
 
 def _reset_temps_on_change(_):
     return gr.update(visible=False, value=None), gr.update(visible=False, value=None)
@@ -2147,8 +2206,18 @@ with gr.Blocks(title="IDEAL Forecasting UI") as demo:
         behavior_factor = gr.Number(value=1.15, minimum=0.01, label="Behavior factor")
 
     with gr.Accordion("Ensemble weights (optional)", open=False):
-        gr.Markdown("Τα βάρη του combined prediction πρέπει να αθροίζουν σε 100%.")
-        use_custom_weights = gr.Checkbox(value=False, label="Use custom ensemble weights")
+        gr.Markdown(
+            "Τα βάρη του combined prediction πρέπει να αθροίζουν σε 100%. "
+            "Όταν τα custom weights είναι απενεργοποιημένα, χρησιμοποιούνται "
+            "αυτόματα διαφορετικά default weights ανά scenario."
+        )
+        ensemble_weights_status = gr.Markdown(
+            _ensemble_status_text(MODE_NO_HISTORY, False)
+        )
+        use_custom_weights = gr.Checkbox(
+            value=False,
+            label="Use custom ensemble weights",
+        )
         with gr.Row(visible=False) as weights_group:
             rf_weight_pct = gr.Number(value=40, minimum=0, maximum=100, label="RF weight (%)")
             xgb_weight_pct = gr.Number(value=30, minimum=0, maximum=100, label="XGB weight (%)")
@@ -2254,8 +2323,23 @@ with gr.Blocks(title="IDEAL Forecasting UI") as demo:
         ],
     )
 
-    use_history.change(fn=_on_use_history_toggle, inputs=[use_history], outputs=[history_group, model_choice])
-    use_custom_weights.change(fn=_toggle_custom_weights, inputs=[use_custom_weights], outputs=[weights_group])
+    use_history.change(
+        fn=_on_use_history_toggle,
+        inputs=[use_history, use_custom_weights],
+        outputs=[
+            history_group,
+            model_choice,
+            rf_weight_pct,
+            xgb_weight_pct,
+            lgbm_weight_pct,
+            ensemble_weights_status,
+        ],
+    )
+    use_custom_weights.change(
+        fn=_toggle_custom_weights,
+        inputs=[use_custom_weights, use_history],
+        outputs=[weights_group, ensemble_weights_status],
+    )
     target_date.change(fn=_reset_temps_on_change, inputs=[target_date], outputs=[t_min, t_max])
     city.change(fn=_reset_temps_on_change, inputs=[city], outputs=[t_min, t_max])
     btn_refresh.click(fn=_refresh_api_status, inputs=[], outputs=[api_status, model_choice])
